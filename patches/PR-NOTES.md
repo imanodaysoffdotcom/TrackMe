@@ -952,6 +952,27 @@ on a stored macOS-Chrome client: L5-6/H2/L3-4 **consistent** (each showing expec
 **genuine contradiction** — its stored IP is `18.88.45.155` (AMAZON-02/AWS), i.e. a "macOS Chrome" whose
 network is a datacenter.
 
+**Per-layer scope chip (follow-up).** Each layer now also carries a **scope chip** naming which part of
+the machine actually produces that signal — and therefore how forgeable it is (`SA_SCOPE`, rendered next
+to the layer label in `saRenderInto`, so it shows in both the live tab and the detail pane):
+
+- **L7 · USER-AGENT** → `application · self-reported` — a free-text HTTP header the app chooses; the most
+  spoofable signal on the stack (and the reason every layer below exists).
+- **L5-6 · TLS / JA4** → `user space · TLS library` — the ClientHello is written by the userland TLS
+  library; fakeable with effort (uTLS / curl-impersonate), which is exactly what the browser-marker check
+  catches.
+- **H2 · FRAMING** → `user space · HTTP library` — pseudo-header order is emitted by the userland HTTP/2
+  implementation.
+- **L3-4 · TCP/IP** → `kernel space · OS` — TTL/window come from the OS kernel's IP/TCP stack; a userland
+  library can't rewrite them without root, so this is the anti-evasion anchor (same thesis as QOSF
+  segment A).
+- **L1-3 · NETWORK · ASN** → `network · routing / ISP` — determined by the network path itself, outside
+  the client's software entirely; needs to *actually* be on that network.
+
+The chips make the "spoofability ladder" explicit: the signal gets harder to forge as you descend
+(application → user space → kernel space → network), so a contradiction at a lower scope outweighs a
+matching claim at a higher one.
+
 ---
 
 ## 21 — Controlled-experiment `?exp=` token capture (feature, in `00-all-changes.patch`)

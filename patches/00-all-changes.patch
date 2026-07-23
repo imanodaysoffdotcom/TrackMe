@@ -6706,7 +6706,7 @@ index 95d896f..455c943 100755
 +	c.HistoryPublic = &pub
  }
 diff --git a/static/index.html b/static/index.html
-index ccfffd6..0da450c 100644
+index ccfffd6..56de13b 100644
 --- a/static/index.html
 +++ b/static/index.html
 @@ -21,11 +21,54 @@
@@ -7442,7 +7442,7 @@ index ccfffd6..0da450c 100644
        };
  
        const toggleTheme = () => {
-@@ -112,15 +819,1833 @@
+@@ -112,15 +819,1855 @@
          }
        };
  
@@ -7458,6 +7458,18 @@ index ccfffd6..0da450c 100644
 +        "ovhcloud", "packet", "equinix", "hostwinds", "ionos", "godaddy", "namecheap",
 +        "cloudflare", "fastly", "servers", "as-", "host europe",
 +      ];
++
++      // Which scope produces each layer's signal — and therefore how spoofable it
++      // is: application (self-reported, free) → user space (fakeable with effort,
++      // e.g. uTLS) → kernel space (needs OS/root control) → network (needs to
++      // actually be on that network). This is the whole cross-layer thesis.
++      const SA_SCOPE = {
++        app: { label: "application · self-reported", color: "#f0533a" },
++        utls: { label: "user space · TLS library", color: "#2dd4bf" },
++        uhttp: { label: "user space · HTTP library", color: "#38bdf8" },
++        kernel: { label: "kernel space · OS", color: "#3b82f6" },
++        network: { label: "network · routing / ISP", color: "#8b5cf6" },
++      };
 +
 +      const saParseUA = (ua) => {
 +        ua = ua || "";
@@ -7513,7 +7525,7 @@ index ccfffd6..0da450c 100644
 +        const L = [];
 +
 +        // L7 — the claim itself (source of every expectation below)
-+        L.push({ layer: "L7 · USER-AGENT", accent: "#f0533a", expected: '"' + claim.label + '"', actual: '"' + claim.label + '"',
++        L.push({ layer: "L7 · USER-AGENT", accent: "#f0533a", scope: SA_SCOPE.app, expected: '"' + claim.label + '"', actual: '"' + claim.label + '"',
 +          evidence: d.user_agent || "—", verdict: "claim",
 +          reason: "The self-reported identity — trivial to fake. Every layer below is checked against it." });
 +
@@ -7533,7 +7545,7 @@ index ccfffd6..0da450c 100644
 +          tV = bt.browser === true ? "unknown" : "consistent";
 +          tR = bt.browser === true ? "A library User-Agent but browser-style TLS extensions — possible impersonation (uTLS / curl-impersonate)." : "Minimal, non-browser TLS — consistent with " + claim.client + ".";
 +        } else { tV = "unknown"; tR = "No browser claimed to cross-check the TLS stack against."; }
-+        L.push({ layer: "L5-6 · TLS / JA4", accent: "#2dd4bf", expected: expTLS, actual: actTLS, evidence: (d.tls || {}).ja4 || d.ja4 || "—", verdict: tV, reason: tR });
++        L.push({ layer: "L5-6 · TLS / JA4", accent: "#2dd4bf", scope: SA_SCOPE.utls, expected: expTLS, actual: actTLS, evidence: (d.tls || {}).ja4 || d.ja4 || "—", verdict: tV, reason: tR });
 +
 +        // H2/H3 — framing (pseudo-header order is a per-browser tell)
 +        const ak = (d.http2 || {}).akamai_fingerprint || (d.http3 || {}).akamai_fingerprint || "";
@@ -7549,7 +7561,7 @@ index ccfffd6..0da450c 100644
 +            claim.client + " sends pseudo-headers " + expOrder + ", but this client sent " + order + " — not " + claim.client + "'s framing.";
 +        } else if (claim.isBrowser) { fV = "unknown"; fR = "No reference framing recorded for " + claim.client + "."; }
 +        else { fV = "unknown"; fR = "Non-browser client — framing shown for reference."; }
-+        L.push({ layer: "H2 · FRAMING", accent: "#38bdf8", expected: expFr, actual: actFr, evidence: ak || "—", verdict: fV, reason: fR });
++        L.push({ layer: "H2 · FRAMING", accent: "#38bdf8", scope: SA_SCOPE.uhttp, expected: expFr, actual: actFr, evidence: ak || "—", verdict: fV, reason: fR });
 +
 +        // L3-4 — TCP/IP kernel (TTL). QUIC has no SYN → reuse the QOSF kernel signal.
 +        const ttl = ((d.tcpip || {}).ip || {}).ttl || 0;
@@ -7573,7 +7585,7 @@ index ccfffd6..0da450c 100644
 +          kV = cv === "mismatch" ? "contradiction" : cv === "consistent" ? "consistent" : "unknown";
 +          kR = (d.qosf.consistency || {}).detail || "Inferred from the QUIC kernel TTL.";
 +        } else { actKern = "no kernel signal captured"; kEv = "—"; kV = "unknown"; kR = "No TCP SYN or QUIC Initial kernel data for this connection."; }
-+        L.push({ layer: "L3-4 · TCP/IP", accent: "#3b82f6", expected: expKern, actual: actKern, evidence: kEv, verdict: kV, reason: kR });
++        L.push({ layer: "L3-4 · TCP/IP", accent: "#3b82f6", scope: SA_SCOPE.kernel, expected: expKern, actual: actKern, evidence: kEv, verdict: kV, reason: kR });
 +
 +        // L1-3 — network / ASN (datacenter vs residential)
 +        const expNet = claim.isBrowser ? "residential / ISP (a real user's network)" : claim.isLibrary ? "any (automated client)" : "any network";
@@ -7590,7 +7602,7 @@ index ccfffd6..0da450c 100644
 +          else if (!dc) { aV = "consistent"; aR = "Residential / ISP network — consistent with a real user."; }
 +          else { aV = "unknown"; aR = ""; }
 +        } else { actNet = "ASN not resolved"; aEv = "—"; aV = "unknown"; aR = "Resolving the network operator…"; }
-+        L.push({ layer: "L1-3 · NETWORK · ASN", accent: "#8b5cf6", expected: expNet, actual: actNet, evidence: aEv, verdict: aV, reason: aR });
++        L.push({ layer: "L1-3 · NETWORK · ASN", accent: "#8b5cf6", scope: SA_SCOPE.network, expected: expNet, actual: actNet, evidence: aEv, verdict: aV, reason: aR });
 +
 +        return L;
 +      };
@@ -7617,9 +7629,19 @@ index ccfffd6..0da450c 100644
 +          const row = pcEl("div", "rounded-md p-4 m-3 flex items-start gap-4 flex-wrap");
 +          row.style.cssText = "border-left:5px solid " + l.accent + ";background:rgba(127,127,127,.06)";
 +          const left = pcEl("div", "grow");
-+          const lab = pcEl("div", "font-mono text-xs font-bold tracking-wider mb-1", l.layer);
++          const labRow = pcEl("div", "flex items-center gap-2 flex-wrap mb-1");
++          const lab = pcEl("div", "font-mono text-xs font-bold tracking-wider", l.layer);
 +          lab.style.color = l.accent;
-+          left.appendChild(lab);
++          labRow.appendChild(lab);
++          if (l.scope) {
++            // Scope chip — which layer of the machine produces this signal, and so
++            // how forgeable it is: application (self-reported, free) → user space
++            // (fakeable with effort) → kernel space (needs OS/root) → network.
++            const chip = pcEl("span", "text-[10px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded", l.scope.label);
++            chip.style.cssText = "background:" + l.scope.color + "22;color:" + l.scope.color + ";border:1px solid " + l.scope.color + "55";
++            labRow.appendChild(chip);
++          }
++          left.appendChild(labRow);
 +          if (l.verdict === "claim") {
 +            left.appendChild(pcEl("div", "text-lg", "says " + l.actual));
 +          } else {
@@ -9278,7 +9300,7 @@ index ccfffd6..0da450c 100644
  
      <div class="flex flex-wrap">
        <a
-@@ -152,6 +2677,22 @@
+@@ -152,6 +2699,22 @@
        </a>
      </div>
  
@@ -9301,7 +9323,7 @@ index ccfffd6..0da450c 100644
      <h2 class="text-2xl pt-5">Request details</h2>
      <hr class="pb-5" />
  
-@@ -327,81 +2868,920 @@
+@@ -327,81 +2890,920 @@
        </div>
      </div>
  
@@ -9679,7 +9701,7 @@ index ccfffd6..0da450c 100644
 +          first. Cool colours = IP/IPv6 base header; warm colours = TCP header. Hover any cell for its
 +          field, byte and bit range. Two layouts below — IPv4 and IPv6 (the IPv6 base header carries fewer
 +          bytes, so the TCP MSS option backfills the image to 144 bits).
-+        </p>
+         </p>
 +        <h3 class="text-sm font-bold text-gray-700 dark:text-gray-200 mb-1">IPv4 SPHBI image</h3>
 +        <div id="bp-sphbi-ipv4" class="mb-6 rounded border border-gray-200 dark:border-gray-700 bg-white p-2 overflow-x-auto"></div>
 +        <h3 class="text-sm font-bold text-gray-700 dark:text-gray-200 mb-1">IPv6 SPHBI image</h3>
@@ -9692,7 +9714,7 @@ index ccfffd6..0da450c 100644
 +          JA4T is not applicable). Unlike the TCP SYN image — an <em>OS</em>-stack fingerprint — this
 +          is an <em>implementation</em> fingerprint. Below are three real captures, all from the
 +          <b>same macOS machine</b>, so every difference is purely the QUIC library.
-         </p>
++        </p>
 +        <div id="bp-quic-stacks" class="rounded border border-gray-200 dark:border-gray-700 bg-white p-3 overflow-x-auto"></div>
        </div>
      </div>
@@ -9736,7 +9758,7 @@ index ccfffd6..0da450c 100644
 +            🗑 Delete all
 +          </button>
 +        </div>
-       </div>
++      </div>
 +      <hr class="mb-4 border-gray-300 dark:border-gray-700" />
 +
 +      <div id="pc-filterbar-home" class="hidden"></div>
@@ -9967,7 +9989,7 @@ index ccfffd6..0da450c 100644
 +          </p>
 +          <div id="pc-detail-content" class="hidden"></div>
 +        </div>
-+      </div>
+       </div>
 +    </div>
 +
 +    <div id="panel-comparative" class="hidden">
