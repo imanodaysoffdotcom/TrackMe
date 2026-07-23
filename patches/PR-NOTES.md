@@ -973,6 +973,31 @@ The chips make the "spoofability ladder" explicit: the signal gets harder to for
 (application → user space → kernel space → network), so a contradiction at a lower scope outweighs a
 matching claim at a higher one.
 
+**QOSF → official QUIC/IP spec map (follow-up, bottom of the Stack Analysis tab).** A new **visual
+diagram** at the bottom of `#panel-stackanalysis` maps **every item of the QOSF fingerprint to the exact
+authoritative IETF spec section that defines it** — frontend-only (`static/index.html`,
+`renderQOSFSpecMap` + `QOSF_SPEC_ITEMS`/`QOSF_SPEC_CIDS`, called from `renderStackAnalysis` with the live
+`qosf`; no backend change, no rebuild). Layout: a colour-segmented format banner (`q‹ttl›…_‹stack›…_‹tp-id-set›_‹tp-values›`)
++ the visitor's **live QOSF** string, then five lanes (**A** kernel red · **B** long-header blue · **C**
+transport-param ID set green · **D** decoded values purple · **Initial packet** amber), each row showing
+the token, a `you:` live-value chip, and one or more **RFC-badge → verbatim-quote** citations (badges link
+to the exact `rfc-editor.org` section). Segment C is a 21-cell grid of every canonical transport-parameter
+ID → its RFC, highlighting the ones the visitor actually sent. **Every mapping was adversarially verified**
+(a 55-agent Workflow fetched each RFC and a *separate* checker re-fetched to confirm section + verbatim
+quote — 44 items, 49 citations, **0 refuted**). Sources: IP/UDP layer — **RFC 791** §3.1 (TTL, DF,
+Version), **RFC 8200** §3 (Hop Limit, Flow Label), **RFC 3168** §5 (ECN) + **RFC 9000** §13.4, **RFC 6437**
+§2 (flow label), **RFC 768** (UDP); QUIC — **RFC 8999** §5.1 (long-header Version/CID-length),
+**RFC 9000** §17.2 (Version field), §18/§7.4 (param order), §18.1 (reserved GREASE), §18.2 (all core
+transport params + values), §16 (varint), §14.1 (1200-byte Initial); extensions — **RFC 9368** (0x11),
+**RFC 9221** (0x20), **RFC 9287** (0x2ab2 grease_quic_bit), **RFC 9369** §3.1 (QUIC v2), **RFC 9001** §8.2
+(the `quic_transport_parameters` TLS extension 0x39 that carries them). Honesty notes surfaced by
+verification and shown in the UI: the derived `stack` code has **no IETF spec** (0x3127/0x3128 are Google
+*provisional* IANA registrations) so it's flagged **⚠ non-standard**; RFC 9000 imposes **no** ordering
+requirement on transport params (so `order` is an implementation tell); and the `0xff0000xx` draft range is
+a convention, not an RFC-reserved block. Live-verified on the droplet (h3 Chromium visitor `q64n1-_ch1st00_…3127.G_…`:
+5 lanes, 51 rfc-editor links + 1 IANA link, live `you:` chips on every item, 0 console errors). Full
+citation table saved at `research/qosf-rfc-mapping.md`.
+
 ---
 
 ## 21 — Controlled-experiment `?exp=` token capture (feature, in `00-all-changes.patch`)
