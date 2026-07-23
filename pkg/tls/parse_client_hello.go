@@ -37,6 +37,9 @@ type ClientHello struct {
 	SignatureAlgorithms       []int
 	PSKKeyExchangeMode        int
 	CertCompressionAlgorithms []int
+
+	// QUIC transport parameters (only present on HTTP/3 ClientHellos)
+	QUICTransportParams []types.QUICTransportParam
 }
 
 func hexToInt(hex string) int {
@@ -551,6 +554,15 @@ func parseRawExtensions(exts []Extension, chp ClientHello) ([]interface{}, Clien
 				tmpC += length
 			}
 			tmp = c
+		case "0039", "ffa5": // quic_transport_parameters (57) and the legacy draft codepoint
+			chp.QUICTransportParams = ParseQUICTransportParameters(d)
+			tmp = struct {
+				Name       string                     `json:"name"`
+				Parameters []types.QUICTransportParam `json:"parameters"`
+			}{
+				Name:       "quic_transport_parameters (57)",
+				Parameters: chp.QUICTransportParams,
+			}
 		default:
 			if types.IsGrease("0x" + strings.ToUpper(ext.Type)) {
 				tmp = struct {

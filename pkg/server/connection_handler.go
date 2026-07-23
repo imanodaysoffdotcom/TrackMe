@@ -5,9 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +36,136 @@ func parseHeaderValue(header, prefix string) string {
 		return ""
 	}
 	return parts[1]
+}
+
+// maxCollectBody caps how many request-body bytes a trusted-collection request
+// stores. Bodies beyond this are truncated and flagged.
+const maxCollectBody = 256 * 1024
+
+// findHeader returns the value of the first header named key (case-insensitive)
+// in a list of "name: value" lines. h2/h3 pseudo-headers (colon at index 0) are
+// skipped. Returns "" when absent.
+func findHeader(headers []string, key string) string {
+	for _, h := range headers {
+		i := strings.Index(h, ":")
+		if i <= 0 {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(h[:i]), key) {
+			return strings.TrimSpace(h[i+1:])
+		}
+	}
+	return ""
+}
+
+// newRequestDetails assembles a RequestDetails from the request line, header
+// lines and captured body. The body is stored base64-encoded so binary payloads
+// survive JSON round-tripping intact. truncated marks a body that hit the cap.
+// redact, when non-empty, names a header to drop from the stored record — used to
+// keep our own collection control header (and its secret) out of the dataset.
+func newRequestDetails(method, target string, headers []string, body []byte, truncated bool, redact string) *types.RequestDetails {
+	var query map[string][]string
+	if i := strings.IndexByte(target, '?'); i >= 0 {
+		if vals, err := url.ParseQuery(target[i+1:]); err == nil && len(vals) > 0 {
+			query = map[string][]string(vals)
+		}
+	}
+	if redact != "" {
+		kept := make([]string, 0, len(headers))
+		for _, h := range headers {
+			if i := strings.Index(h, ":"); i > 0 && strings.EqualFold(strings.TrimSpace(h[:i]), redact) {
+				continue // drop our collection control header (carries the secret)
+			}
+			kept = append(kept, h)
+		}
+		headers = kept
+	}
+	rd := &types.RequestDetails{
+		Method:      method,
+		Target:      target,
+		Query:       query,
+		Headers:     headers,
+		ContentType: findHeader(headers, "content-type"),
+		BodyBytes:   len(body),
+		Truncated:   truncated,
+		CapturedTS:  time.Now().Unix(),
+	}
+	if len(body) > 0 {
+		rd.BodyB64 = base64.StdEncoding.EncodeToString(body)
+	}
+	return rd
+}
+
+// captureHTTP1Request builds the trusted-collection record for an HTTP/1 request.
+// raw is the exact bytes read so far (request line + headers + any buffered body);
+// when Content-Length promises more body than is buffered, the remainder is read
+// from conn (bounded by maxCollectBody and a short deadline) before the response
+// is written.
+func captureHTTP1Request(conn net.Conn, details types.Response, raw []byte, collectKey string) *types.RequestDetails {
+	var headers []string
+	if details.Http1 != nil {
+		headers = details.Http1.Headers
+	}
+	var body []byte
+	if idx := bytes.Index(raw, []byte("\r\n\r\n")); idx >= 0 {
+		body = append(body, raw[idx+4:]...)
+	}
+	truncated := false
+	if cl, err := strconv.Atoi(findHeader(headers, "content-length")); err == nil && cl > len(body) {
+		need := cl - len(body)
+		if room := maxCollectBody - len(body); need > room {
+			need = room
+			truncated = true
+		}
+		if need > 0 {
+			_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+			extra := make([]byte, need)
+			n, _ := io.ReadFull(conn, extra)
+			body = append(body, extra[:n]...)
+			_ = conn.SetReadDeadline(time.Time{}) // clear before writing the response
+		}
+	}
+	if len(body) > maxCollectBody {
+		body = body[:maxCollectBody]
+		truncated = true
+	}
+	return newRequestDetails(details.Method, details.Path, headers, body, truncated, collectKey)
+}
+
+// captureHTTP2Request builds the trusted-collection record for an HTTP/2 request.
+// The body is reassembled from the DATA-frame payloads already collected by the
+// frame loop (no extra read), so it never perturbs the h2 fingerprinting.
+func captureHTTP2Request(method, path string, headers []string, frames []types.ParsedFrame, collectKey string) *types.RequestDetails {
+	var body []byte
+	truncated := false
+	for _, f := range frames {
+		if f.Type != "DATA" || len(f.Payload) == 0 {
+			continue
+		}
+		body = append(body, f.Payload...)
+		if len(body) >= maxCollectBody {
+			body = body[:maxCollectBody]
+			truncated = true
+			break
+		}
+	}
+	return newRequestDetails(method, path, headers, body, truncated, collectKey)
+}
+
+// captureHTTP3Request builds the trusted-collection record for an HTTP/3 request,
+// reading the body from the standard request stream (bounded by maxCollectBody).
+func captureHTTP3Request(r *http.Request, headers []string, collectKey string) *types.RequestDetails {
+	var body []byte
+	truncated := false
+	if r.Body != nil {
+		b, _ := io.ReadAll(io.LimitReader(r.Body, maxCollectBody+1))
+		if len(b) > maxCollectBody {
+			b = b[:maxCollectBody]
+			truncated = true
+		}
+		body = b
+	}
+	return newRequestDetails(r.Method, r.URL.RequestURI(), headers, body, truncated, collectKey)
 }
 
 func parseHTTP1(request []byte) types.Response {
@@ -129,8 +261,8 @@ func parseHTTP2(f *http2.Framer, c chan types.ParsedFrame) {
 			}
 
 			for _, h := range h2Headers {
-  				headerStr := fmt.Sprintf("%s: %s", h.Name, h.Value)
-   	 			p.Headers = append(p.Headers, headerStr)
+				headerStr := fmt.Sprintf("%s: %s", h.Name, h.Value)
+				p.Headers = append(p.Headers, headerStr)
 			}
 			if frame.HasPriority() {
 				prio := types.Priority{}
@@ -206,10 +338,13 @@ func (srv *Server) HandleTLSConnection(conn net.Conn) error {
 		JA3Hash:          JA3Data.JA3Hash,
 		PeetPrint:        peetfp,
 		PeetPrintHash:    peetprintHash,
-		SessionID:        parsedClientHello.SessionID,
-		ClientRandom:     parsedClientHello.ClientRandom,
-		RawBytes:         hs,
-		RawB64:           rawB64,
+
+		QUICTransportParameters: parsedClientHello.QUICTransportParams,
+
+		SessionID:    parsedClientHello.SessionID,
+		ClientRandom: parsedClientHello.ClientRandom,
+		RawBytes:     hs,
+		RawB64:       rawB64,
 	}
 
 	// Check if the first line is HTTP/2
@@ -218,7 +353,7 @@ func (srv *Server) HandleTLSConnection(conn net.Conn) error {
 	} else {
 		// Read the rest of the request
 		r2 := make([]byte, 1024-l)
-		_, err := conn.Read(r2)
+		n2, err := conn.Read(r2)
 		if err != nil {
 			return fmt.Errorf("failed to read HTTP/1 request: %w", err)
 		}
@@ -229,6 +364,15 @@ func (srv *Server) HandleTLSConnection(conn net.Conn) error {
 		details := parseHTTP1(request)
 		details.IP = conn.RemoteAddr().String()
 		details.TLS = &tlsDetails
+		// Trusted-collection: capture the raw request (incl. body) when it carries
+		// the configured collection header + secret. Done before responding so the
+		// body's remaining bytes can still be read off the open connection.
+		if srv.collectAuthorized(details) {
+			raw := make([]byte, 0, l+n2)
+			raw = append(raw, request[:l]...) // first read: request line + headers start
+			raw = append(raw, r2[:n2]...)     // second read: rest of headers + buffered body
+			details.Request = captureHTTP1Request(conn, details, raw, srv.GetConfig().CollectKey)
+		}
 		srv.respondToHTTP1(conn, details)
 	}
 	return nil
@@ -365,6 +509,13 @@ func (srv *Server) handleHTTP2(conn net.Conn, tlsFingerprint *types.TLSDetails) 
 		TLS: tlsFingerprint,
 	}
 
+	// Trusted-collection: capture the raw request when it carries the configured
+	// collection header + secret. The body is reassembled from the DATA frames the
+	// loop already collected, so h2 fingerprinting is untouched.
+	if srv.collectAuthorized(resp) {
+		resp.Request = captureHTTP2Request(method, path, headerFrame.Headers, frames, srv.GetConfig().CollectKey)
+	}
+
 	var res []byte
 	var ctype = "text/plain"
 	if method != "OPTIONS" {
@@ -461,6 +612,9 @@ func (srv *Server) HandleHTTP3() http.Handler {
 				ClientRandom:     parsedClientHello.ClientRandom,
 				RawBytes:         clientHelloHex,
 				RawB64:           rawB64,
+
+				// QUIC-only: feeds CalculateJa4QUIC and BuildQUICSPHBI in the router.
+				QUICTransportParameters: parsedClientHello.QUICTransportParams,
 			}
 		}
 
@@ -498,10 +652,12 @@ func (srv *Server) HandleHTTP3() http.Handler {
 		resp := types.Response{
 			IP:          r.RemoteAddr,
 			HTTPVersion: "h3",
-			Path:        r.URL.Path,
-			Method:      r.Method,
-			UserAgent:   r.Header.Get("User-Agent"),
-			TLS:         tlsDetails,
+			// RequestURI() keeps the query string (r.URL.Path drops it), so the
+			// stored path matches h1/h2 and a visit's ?query is retained.
+			Path:      r.URL.RequestURI(),
+			Method:    r.Method,
+			UserAgent: r.Header.Get("User-Agent"),
+			TLS:       tlsDetails,
 			Http3: &types.Http3Details{
 				Used0RTT:                           h3state.Used0RTT,
 				SupportsDatagrams:                  h3state.SupportsDatagrams,
@@ -515,7 +671,15 @@ func (srv *Server) HandleHTTP3() http.Handler {
 			},
 		}
 
-		res, ctype, err := Router(r.URL.Path, resp, srv)
+		// Trusted-collection: capture the raw request (incl. body) when it carries
+		// the configured collection header + secret.
+		if srv.collectAuthorized(resp) {
+			resp.Request = captureHTTP3Request(r, headers, srv.GetConfig().CollectKey)
+		}
+
+		// RequestURI() keeps the query string (r.URL.Path drops it), so endpoints
+		// like /api/client?key=… work over HTTP/3, not just h1/h2.
+		res, ctype, err := Router(r.URL.RequestURI(), resp, srv)
 		if err != nil {
 			log.Println("Router error:", err)
 			res = []byte(fmt.Sprintf(`{"error": "%s"}`, err.Error()))

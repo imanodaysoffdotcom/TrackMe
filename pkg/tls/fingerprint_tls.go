@@ -137,6 +137,8 @@ func CalculatePeetPrint(parsed ClientHello, j JA3Calculating) (string, string) {
 	for _, v := range parsed.SupportedProtocols {
 		if strings.ToLower(v) == "h2" {
 			tmp = append(tmp, "2")
+		} else if strings.ToLower(v) == "h3" {
+			tmp = append(tmp, "3")
 		} else if strings.ToLower(v) == "http/1.1" {
 			tmp = append(tmp, "1.1")
 		} else if strings.ToLower(v) == "http/1.0" {

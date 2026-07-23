@@ -13,6 +13,7 @@ import (
 
 	"github.com/pagpeter/quic-go"
 	"github.com/pagpeter/quic-go/http3"
+	"github.com/pagpeter/trackme/pkg/geo"
 	"github.com/pagpeter/trackme/pkg/server"
 	"github.com/pagpeter/trackme/pkg/tcp"
 	"github.com/pagpeter/trackme/pkg/utils"
@@ -56,6 +57,17 @@ func init() {
 
 	if err := srv.GetConfig().LoadFromFile(); err != nil {
 		log.Fatal(err)
+	}
+
+	// Connect the Redis visit store (non-fatal: run without history if it's down).
+	if err := srv.InitStore(); err != nil {
+		log.Printf("redis store disabled: %v", err)
+	}
+
+	// IP geolocation for the Previous Clients map (non-fatal: a missing DB just
+	// disables the map).
+	if err := geo.Init("dbip-city.mmdb"); err != nil {
+		log.Printf("geo disabled: %v", err)
 	}
 }
 

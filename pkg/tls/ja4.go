@@ -39,7 +39,7 @@ func ja4aWithProto(tls *types.TLSDetails, proto string) string {
 	numExtensions := len(strings.Split(strings.Split(tls.JA3, ",")[2], "-"))
 	firstALPN := getOrReturnOG(strings.Split(strings.Split(tls.PeetPrint, "|")[1], "-")[0], httpVersionMapping)
 
-	return fmt.Sprintf("%v%v%v%v%v%v", proto, tlsVersion, sniMode, numSuites, numExtensions, firstALPN)
+	return fmt.Sprintf("%s%s%s%02d%02d%s", proto, tlsVersion, sniMode, min(numSuites, 99), min(numExtensions, 99), firstALPN)
 }
 
 func ja4b_r(tls *types.TLSDetails) string {

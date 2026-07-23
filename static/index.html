@@ -21,10 +21,53 @@
         transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
         transition-duration: 150ms;
       }
+      /* Draggable reorder of Previous-Clients detail sections. */
+      .pc-section {
+        position: relative;
+      }
+      .pc-section.pc-dragging {
+        opacity: 0.4;
+      }
+      .pc-section.pc-drop-before {
+        box-shadow: inset 0 4px 0 -1px #f59e0b;
+      }
+      .pc-section.pc-drop-after {
+        box-shadow: inset 0 -4px 0 -1px #f59e0b;
+      }
+      .pc-drag-handle {
+        cursor: grab;
+        user-select: none;
+        transition: none;
+      }
+      .pc-drag-handle:active {
+        cursor: grabbing;
+      }
     </style>
     <script>
       const insert = (data) => {
         d = document;
+
+        const ipRaw = data.ip || "-";
+        let ipShown = ipRaw;
+        const ipV6 = ipRaw.match(/^\[(.+)\]:\d+$/);
+        if (ipV6) ipShown = ipV6[1];
+        else if ((ipRaw.match(/:/g) || []).length === 1) ipShown = ipRaw.split(":")[0];
+        const ipEl = d.getElementById("client-ip");
+        if (ipEl) ipEl.innerText = ipShown;
+
+        // Current client's ASN (network operator) — async, non-blocking.
+        fetch("/api/asn")
+          .then((r) => r.json())
+          .then((a) => {
+            const el = d.getElementById("client-asn");
+            if (!el) return;
+            el.innerText =
+              a && a.asn
+                ? a.asn + (a.as_name ? " · " + a.as_name : "") + (a.country_code ? " · " + a.country_code : "")
+                : "—";
+            if (a && (a.isp || a.org)) el.title = [a.isp, a.org].filter(Boolean).join(" / ");
+          })
+          .catch(() => {});
 
         let groups = [];
         let protos = [];
@@ -49,6 +92,8 @@
         d.getElementById("ja4").innerText = data.tls.ja4;
 
         d.getElementById("ttl").innerText = data.tcpip?.ip?.ttl || "-";
+
+        d.getElementById("ja4t").innerText = data.tcpip?.ja4t || "-";
 
         d.getElementById("akamai-hash").innerText =
           data.http3?.akamai_fingerprint_hash || data.http2?.akamai_fingerprint_hash || "-";
@@ -100,6 +145,668 @@
         groups.forEach((curve, i) => {
           curveTable.insertRow(i + 1).innerHTML = `<td>${curve}</td>`;
         });
+
+        // SPHBI - Single Packet Header Binary Image (El-Sherif et al. 2025)
+        renderSPHBI(data.sphbi, data.tcpip?.ja4t);
+        renderBlueprint(data.tcpip?.ja4t, data.tls?.ja4, data.ip);
+        applyQOSF(data.qosf, data.http_version);
+      };
+
+      const renderSPHBI = (sphbi, ja4t) => {
+        const d = document;
+        const canvas = d.getElementById("sphbi-canvas");
+        const missing = d.getElementById("sphbi-missing");
+        if (!canvas) return;
+        if (!sphbi || !sphbi.bits) {
+          if (missing) missing.classList.remove("hidden");
+          return;
+        }
+        if (missing) missing.classList.add("hidden");
+
+        const kind = sphbi.kind || "ipv4";
+        const meta = {
+          ipv4: {
+            type: (sphbi.packet_type || "SYN") + " · IPv4",
+            bytes: "18 selected header bytes (Table 2)",
+            intro:
+              "Your live TCP SYN packet header (IPv4), encoded as an 18-byte / 144-bit 12×12 binary image (El-Sherif et al. 2025). Source/dest IP, both checksums and the TCP sequence/ack numbers are excluded. Real packet — nothing synthetic.",
+          },
+          ipv6: {
+            type: (sphbi.packet_type || "SYN") + " · IPv6",
+            bytes: "18 selected header bytes (8 IPv6 + 8 TCP + MSS)",
+            intro:
+              "Your live TCP SYN packet header (IPv6): 8 IPv6 header bytes + 8 TCP bytes + the 2-byte TCP MSS option = 18 bytes / 144 bits / 12×12. Bytes 3-4 carry the IPv6 flow label. IPs and checksums are excluded. Real packet — nothing synthetic.",
+          },
+          quic: {
+            type: "QUIC Initial · transport params",
+            bytes: "QUIC transport parameters (client order)",
+            intro:
+              "QUIC has no TCP SYN, so this 12×12 image encodes your QUIC transport parameters (presence + value fold across 16 canonical slots) from the HTTP/3 ClientHello — a transport-parameter fingerprint. Real connection — nothing synthetic.",
+          },
+        }[kind] || {};
+
+        d.getElementById("sphbi-type").innerText =
+          meta.type || sphbi.packet_type || "-";
+        const bl = d.getElementById("sphbi-bytes-label");
+        if (bl && meta.bytes) bl.innerText = meta.bytes;
+        const intro = d.getElementById("sphbi-intro");
+        if (intro && meta.intro) intro.innerText = meta.intro;
+        d.getElementById("sphbi-hex").innerText = sphbi.hex;
+
+        // JA4T is derived from the SAME captured SYN as this image (window,
+        // TCP option order, MSS, window scale). It is TCP-only, so a QUIC/HTTP-3
+        // connection (no TCP SYN) has no JA4T.
+        const j = d.getElementById("sphbi-ja4t");
+        if (j) {
+          j.innerText =
+            kind === "quic"
+              ? "— not applicable (QUIC / HTTP-3 has no TCP SYN; JA4T is TCP-only)"
+              : ja4t || "—";
+        }
+
+        const n = sphbi.size || 12;
+        canvas.width = n;
+        canvas.height = n;
+        const ctx = canvas.getContext("2d");
+        const img = ctx.createImageData(n, n);
+        for (let i = 0; i < n * n && i < sphbi.bits.length; i++) {
+          const on = sphbi.bits[i] === "1" ? 255 : 0; // 1 = white, 0 = black
+          img.data[i * 4 + 0] = on;
+          img.data[i * 4 + 1] = on;
+          img.data[i * 4 + 2] = on;
+          img.data[i * 4 + 3] = 255;
+        }
+        ctx.putImageData(img, 0, 0);
+
+        const ft = d.getElementById("sphbi-fields");
+        (sphbi.fields || []).forEach((f, i) => {
+          ft.insertRow(i + 1).innerHTML =
+            `<td class="pr-4">${f.name}</td><td class="pr-4">${f.bytes}</td><td class="font-mono">${f.hex}</td>`;
+        });
+      };
+
+      const renderBlueprint = (ja4t, ja4tls, ip) => {
+        const SVGNS = "http://www.w3.org/2000/svg";
+        const root = document.getElementById("panel-blueprint");
+        if (!root) return;
+        const r4t = ja4t || "65535_2-1-3-1-1-4_1460_8";
+        const r4tls = ja4tls || "t13d1516h2_8daaf6152771_b0da82dd1658";
+        const C = { red: "#bf3a2b", blue: "#1f5fd0", orange: "#d9741b", green: "#1f8a4c" };
+        const OPT = { 0: "EOL", 1: "NOP", 2: "MSS", 3: "WScale", 4: "SACK-perm", 5: "SACK", 8: "Timestamps" };
+        const el = (n, a) => { const e = document.createElementNS(SVGNS, n); for (const k in a) e.setAttribute(k, a[k]); return e; };
+        const tx = (x, y, s, a) => { const t = el("text", a || {}); t.setAttribute("x", x); t.setAttribute("y", y); t.textContent = s; return t; };
+        const set = (id, v) => { const e = document.getElementById(id); if (e) e.textContent = v; };
+
+        const p = r4t.split("_");
+        const win = p[0], opts = (p[1] || "").split("-").filter(Boolean), mss = p[2], ws = p[3];
+        set("bp-v-window", win); set("bp-v-mss", mss); set("bp-v-wscale", ws);
+        const go = document.getElementById("bp-v-options");
+        if (go) { go.innerHTML = ""; opts.forEach((k, i) => {
+          const x = 58 + (i % 5) * 32, y = 482 + Math.floor(i / 5) * 26, g = el("g", {});
+          g.appendChild(el("rect", { x, y: y - 12, width: 28, height: 22, rx: 3, fill: C.red, "fill-opacity": .12, stroke: C.red, "stroke-width": 1 }));
+          g.appendChild(tx(x + 14, y, k, { "text-anchor": "middle", fill: C.red, "font-size": 13 }));
+          const tp = el("title", {}); tp.textContent = OPT[k] || ("kind " + k); g.appendChild(tp); go.appendChild(g);
+        }); }
+
+        const q = r4tls.split("_"), h = q[0] || "";
+        const tr = h[0], ver = h.slice(1, 3), sni = h[3], cc = h.slice(4, 6), ec = h.slice(6, 8), alpn = h.slice(8);
+        const gh = document.getElementById("bp-v-header");
+        if (gh) { gh.innerHTML = "";
+          const row = (y, parts) => { const t = el("text", { x: 872, y, "font-size": 11 }); parts.forEach((pp) => { const ts = el("tspan", { fill: pp[1] }); ts.textContent = pp[0] + " "; t.appendChild(ts); }); gh.appendChild(t); };
+          row(268, [[tr === "t" ? "t·TCP" : "q·QUIC", C.blue], ["v1." + (ver === "13" ? "3" : ver === "12" ? "2" : ver), C.blue], [sni === "d" ? "SNI·dom" : "SNI·ip", C.blue]]);
+          row(290, [[cc + "·ciph", C.orange], [ec + "·ext", C.green], ["ALPN·" + (alpn === "00" ? "none" : alpn), C.blue]]);
+        }
+        set("bp-v-ciphercount", cc); set("bp-v-cipherhash", q[1] || "—");
+        set("bp-v-extcount", ec); set("bp-v-exthash", q[2] || "—");
+
+        const ribbon = (hostId, items) => {
+          const host = document.getElementById(hostId); if (!host) return; host.innerHTML = "";
+          let x = 0; const FS = 23, cw = FS * 0.62, pad = 11, hh = 40;
+          items.forEach((it, idx) => {
+            if (idx > 0) { host.appendChild(tx(x + 5, hh / 2, "_", { fill: "#b9b2a1", "font-size": FS })); x += 18; }
+            const w = it.text.length * cw + pad * 2, g = el("g", { class: "bp-cap", "data-key": it.key });
+            g.appendChild(el("rect", { class: "bp-capbg", x, y: 0, width: w, height: hh, rx: 6, fill: it.color, "fill-opacity": .13, stroke: it.color, "stroke-width": 1.4 }));
+            g.appendChild(tx(x + pad, hh / 2, it.text, { fill: it.color, "font-size": FS }));
+            if (it.sub) g.appendChild(tx(x + pad, hh + 13, it.sub, { fill: "#7c766a", "font-size": 10.5 }));
+            host.appendChild(g); x += w;
+          });
+        };
+        ribbon("bp-ribbon-ja4t", [{ text: win, color: C.red, key: "window", sub: "window" }, { text: opts.join("-"), color: C.red, key: "options", sub: "options order" }, { text: mss, color: C.red, key: "mss", sub: "MSS" }, { text: ws, color: C.red, key: "wscale", sub: "wscale" }]);
+        ribbon("bp-ribbon-ja4tls", [{ text: h, color: C.blue, key: "header", sub: "ver·SNI·counts·ALPN" }, { text: q[1] || "", color: C.orange, key: "cipher", sub: "cipher hash" }, { text: q[2] || "", color: C.green, key: "ext", sub: "extension hash" }]);
+
+        set("bp-ts", new Date().toISOString().replace("T", " ").slice(0, 19) + "Z");
+        set("bp-ip", ip || "—");
+
+        const setHL = (key, on) => root.querySelectorAll('[data-key="' + key + '"]').forEach((n) => n.classList.toggle("bp-hl", on));
+        root.querySelectorAll("[data-key]").forEach((n) => {
+          const k = n.getAttribute("data-key");
+          n.addEventListener("mouseenter", () => setHL(k, true));
+          n.addEventListener("mouseleave", () => setHL(k, false));
+        });
+
+        // Static reference diagrams: the SPHBI image-matrix field maps.
+        renderSphbiMatrix("bp-sphbi-ipv4", "ipv4");
+        renderSphbiMatrix("bp-sphbi-ipv6", "ipv6");
+        renderQuicStacks();
+      };
+
+      // ===== QOSF · QUIC OS Fingerprint (current user) =====================
+      // QUIC-only. The inline page-load data is usually h2 (no qosf), so we
+      // auto-refetch /api/all once — browsers upgrade to h3 via Alt-Svc — plus a
+      // manual recheck button. All stored values render via textContent.
+      const QOSF_SEG = [
+        { key: "seg_kernel", badge: "A", name: "Kernel · OS", color: "#bf3a2b", space: "kernel",
+          source: "Your UDP/IP header, read by the packet tap — the OS signal (initial TTL / hop-limit)." },
+        { key: "seg_stack", badge: "B", name: "Userspace stack", color: "#1f5fd0", space: "user",
+          source: "quic-go terminator (version · order · grease) + the QUIC long header via pcap (SCID length)." },
+        { key: "seg_tp_set", badge: "C", name: "Transport-param id-set", color: "#1f8a4c", space: "user",
+          source: "The QUIC transport-parameter IDs the client sent, sorted; reserved-GREASE collapsed to G." },
+        { key: "seg_tp_values", badge: "D", name: "Transport-param values", color: "#7c3aed", space: "user",
+          source: "Decoded values of 7 well-known params (— = the client did not send it; never a default)." },
+      ];
+      // Kernel space (the OS writes the IP/UDP header) vs. user space (the QUIC
+      // library writes everything QUIC) — the load-bearing QOSF distinction.
+      const QOSF_SPACE = {
+        kernel: { color: "#bf3a2b", title: "🧬 Kernel space (OS)", sub: "the IP/UDP header the OS kernel writes" },
+        user: { color: "#1f5fd0", title: "🧩 User space (QUIC library)", sub: "everything the userspace QUIC library puts on the wire" },
+      };
+      const QOSF_SEG_FIELDS = {
+        seg_kernel: ["ttl", "ip", "ecn", "df", "flow"],
+        seg_stack: ["stack", "ver", "order", "grease", "scid"],
+        seg_tp_values: ["idle", "acid", "madelay", "adexp", "mudp", "mdata", "sbidi"],
+      };
+      const QOSF_FIELD_DOC = {
+        ttl: "Initial IP TTL / hop-limit, inferred by rounding the observed value up to 32/64/128/255 (→3/6/1/2). The OS-family signal.",
+        ip: "IP version — 4 or 6.",
+        ecn: "ECN codepoint on the IP header (n/1/0/c).",
+        df: "IPv4 Don't-Fragment bit (— for IPv6, which has none).",
+        flow: "IPv6 flow label — zero(z)/nonzero(n) (— for IPv4, which has none).",
+        stack: "QUIC library, from a verified transport-param signature; xx = unclassified (never guessed).",
+        ver: "Negotiated QUIC version (1=v1, 2=v2, d=draft).",
+        order: "Transport-param wire order: a=ascending, s=shuffled, g=leads with GREASE.",
+        grease: "GREASE usage: b=grease_quic_bit, t=reserved-GREASE param, x=both.",
+        scid: "Client Source Connection ID length, read from the QUIC long header (pcap).",
+        idle: "max_idle_timeout (ms).",
+        acid: "active_connection_id_limit.",
+        madelay: "max_ack_delay (ms).",
+        adexp: "ack_delay_exponent.",
+        mudp: "max_udp_payload_size.",
+        mdata: "initial_max_data.",
+        sbidi: "initial_max_streams_bidi.",
+      };
+      let qosfAutoTried = false;
+
+      const qosfStatus = (f) => {
+        if (!f) return { label: "absent", color: "#9ca3af" };
+        if (f.observed) return { label: "observed", color: "#1f8a4c" };
+        if (f.value === "-") return { label: "absent", color: "#9ca3af" };
+        return { label: "derived", color: "#d9741b" };
+      };
+
+      const applyQOSF = (qosf, httpVersion) => {
+        const d = document;
+        const card = d.getElementById("qosf");
+        const note = d.getElementById("qosf-note");
+        if (card) card.innerText = qosf ? qosf.qosf : "— (HTTP/3 only)";
+        if (note) {
+          let n = qosf
+            ? (qosf.source === "pcap+quic"
+                ? "QUIC OS fingerprint · full (pcap + QUIC)"
+                : "QUIC OS fingerprint · socket-only")
+            : "QUIC-only — visit over HTTP/3 to compute your QOSF.";
+          if (qosf && qosf.os && qosf.os.family && qosf.os.family !== "unknown")
+            n += " · inferred OS: " + qosf.os.family;
+          if (qosf && qosf.consistency && qosf.consistency.verdict === "mismatch")
+            n += " · ⚠ OS mismatch (possible mimic/proxy)";
+          note.innerText = n;
+        }
+        const empty = d.getElementById("qosf-empty");
+        const view = d.getElementById("qosf-view");
+        if (!qosf) {
+          if (empty) empty.classList.remove("hidden");
+          if (view) view.classList.add("hidden");
+          const p = d.getElementById("qosf-empty-proto");
+          if (p)
+            p.innerText =
+              httpVersion === "h3"
+                ? "HTTP/3 (no QUIC ClientHello — 0-RTT / resumed?)"
+                : httpVersion === "h2"
+                ? "HTTP/2 (TCP)"
+                : "HTTP/1.1 (TCP)";
+          // Try once over h3 so the QOSF appears without a manual click.
+          if (!qosfAutoTried && httpVersion !== "h3") {
+            qosfAutoTried = true;
+            qosfRefetch();
+          }
+          return;
+        }
+        if (empty) empty.classList.add("hidden");
+        if (view) view.classList.remove("hidden");
+        renderQOSFDiagram(qosf);
+      };
+
+      const qosfRefetch = () => {
+        const btns = document.querySelectorAll(".qosf-recheck-btn");
+        btns.forEach((b) => (b.textContent = "Rechecking over HTTP/3…"));
+        fetch("/api/all", { cache: "no-store" })
+          .then((r) => r.json())
+          .then((d) => applyQOSF(d.qosf, d.http_version))
+          .catch(() => {})
+          .finally(() =>
+            btns.forEach((b) => (b.textContent = b.dataset.label || "Recheck over HTTP/3"))
+          );
+      };
+
+      const renderQOSFDiagram = (qosf) => {
+        const d = document;
+        const mk = (tag, cls, txt) => {
+          const e = d.createElement(tag);
+          if (cls) e.className = cls;
+          if (txt != null) e.textContent = txt;
+          return e;
+        };
+
+        // 1) Color-segmented canonical string + source badge.
+        const strEl = d.getElementById("qosf-string");
+        if (strEl) {
+          strEl.innerHTML = "";
+          QOSF_SEG.forEach((s, i) => {
+            if (i > 0) strEl.appendChild(mk("span", "text-gray-400", "_"));
+            const sp = mk("span", null, qosf[s.key] || "");
+            sp.style.color = s.color;
+            sp.style.fontWeight = "700";
+            strEl.appendChild(sp);
+          });
+        }
+        const src = d.getElementById("qosf-source");
+        if (src) {
+          const full = qosf.source === "pcap+quic";
+          src.textContent = full ? "pcap + QUIC · full" : "socket-only · segment A limited";
+          src.style.background = full ? "#1f8a4c" : "#d9741b";
+          src.style.color = "#fff";
+        }
+
+        // 1b) OS-family inference (from the kernel TTL — segment A).
+        const osHost = d.getElementById("qosf-os");
+        if (osHost) {
+          osHost.innerHTML = "";
+          const os = qosf.os || { family: "unknown", confidence: "none", basis: "" };
+          const confColor =
+            os.confidence === "moderate" ? "#1f8a4c" : os.confidence === "low" ? "#d9741b" : "#9ca3af";
+          const head = mk("div", "flex items-center gap-2 flex-wrap mb-1");
+          head.appendChild(mk("span", "font-bold", "🖥  Inferred OS"));
+          const fam = mk("span", "text-lg font-bold", os.family);
+          fam.style.color = confColor;
+          head.appendChild(fam);
+          const chip = mk("span", "text-xs px-2 py-0.5 rounded", os.confidence + " confidence");
+          chip.style.cssText = "background:" + confColor + "22;color:" + confColor;
+          head.appendChild(chip);
+          osHost.appendChild(head);
+          if (os.candidates && os.candidates.length) {
+            const cand = mk("p", "text-sm mb-1");
+            cand.appendChild(mk("span", "text-gray-500", "Candidates: "));
+            cand.appendChild(mk("span", "font-mono", os.candidates.join(" · ")));
+            osHost.appendChild(cand);
+          }
+          osHost.appendChild(mk("p", "text-xs text-gray-500", os.basis));
+        }
+
+        // 1b2) Cross-layer consistency: kernel-OS (TTL) vs. User-Agent-claimed OS.
+        // A userspace QUIC mimic (uQUIC) forges the whole QUIC layer but not the
+        // kernel TTL, so a mismatch is a spoof/proxy signal.
+        const conHost = d.getElementById("qosf-consistency");
+        if (conHost) {
+          conHost.innerHTML = "";
+          const con = qosf.consistency || { verdict: "unknown", detail: "" };
+          const cc = con.verdict === "mismatch" ? "#bf3a2b" : con.verdict === "consistent" ? "#1f8a4c" : "#9ca3af";
+          conHost.style.borderLeft = "5px solid " + cc;
+          const head = mk("div", "flex items-center gap-2 flex-wrap mb-1");
+          head.appendChild(mk("span", "font-bold", (con.verdict === "mismatch" ? "⚠️  " : "🔗  ") + "Cross-layer consistency"));
+          const vch = mk("span", "text-sm font-bold px-2 py-0.5 rounded", con.verdict);
+          vch.style.cssText = "background:" + cc + "22;color:" + cc;
+          head.appendChild(vch);
+          conHost.appendChild(head);
+          if (con.claimed_os || con.kernel_os) {
+            const line = mk("p", "text-sm mb-1");
+            line.appendChild(mk("span", "text-gray-500", "User-Agent claims "));
+            const c1 = mk("span", "font-bold", con.claimed_os || "—");
+            c1.style.color = cc;
+            line.appendChild(c1);
+            line.appendChild(mk("span", "text-gray-500", "  ·  kernel TTL says "));
+            const c2 = mk("span", "font-bold", con.kernel_os || "—");
+            c2.style.color = cc;
+            line.appendChild(c2);
+            conHost.appendChild(line);
+          }
+          conHost.appendChild(mk("p", "text-xs text-gray-500", con.detail));
+        }
+
+        // 1c) Kernel space vs. user space split.
+        const spacesHost = d.getElementById("qosf-spaces");
+        if (spacesHost) {
+          spacesHost.innerHTML = "";
+          const spaceRow = (spaceKey, spaceObj) => {
+            const meta = QOSF_SPACE[spaceKey];
+            const row = mk("div", "rounded-md p-3 mb-2");
+            row.style.cssText = "border-left:5px solid " + meta.color + ";background:" + meta.color + "0f";
+            const head = mk("div", "flex items-center gap-2 flex-wrap mb-1");
+            const t = mk("span", "font-bold");
+            t.style.color = meta.color;
+            t.textContent = meta.title;
+            head.appendChild(t);
+            const segs = mk("span", "text-xs px-1.5 py-0.5 rounded");
+            segs.style.cssText = "background:" + meta.color + "22;color:" + meta.color;
+            const list = spaceObj.segments || [];
+            segs.textContent = "segment" + (list.length > 1 ? "s " : " ") + list.join(" · ");
+            head.appendChild(segs);
+            row.appendChild(head);
+            const v = mk("p", "font-mono break-all text-lg mb-1", spaceObj.value || "—");
+            v.style.color = meta.color;
+            row.appendChild(v);
+            row.appendChild(mk("p", "text-xs text-gray-500", meta.sub));
+            return row;
+          };
+          if (qosf.kernel_space) spacesHost.appendChild(spaceRow("kernel", qosf.kernel_space));
+          if (qosf.user_space) spacesHost.appendChild(spaceRow("user", qosf.user_space));
+        }
+
+        // 1e) QUIC Initial packet structure (userspace, informational). The shape a
+        // passive decryptor (finch) reads and a mimic (uQUIC) forges.
+        const ipHost = d.getElementById("qosf-initial");
+        if (ipHost) {
+          const ip = qosf.initial_packet;
+          if (ip) {
+            ipHost.classList.remove("hidden");
+            ipHost.innerHTML = "";
+            ipHost.appendChild(mk("h2", "font-bold mb-2", "QUIC Initial packet (on the wire)"));
+            const row = mk("div", "flex flex-wrap gap-5 text-sm mb-1");
+            const kv = (k, v) => {
+              const s = mk("span", null);
+              s.appendChild(mk("span", "text-gray-500", k + " "));
+              const b = mk("span", "font-mono font-bold", v);
+              b.style.color = "#1f5fd0";
+              s.appendChild(b);
+              return s;
+            };
+            row.appendChild(kv("version", "v" + (ip.quic_version || "?")));
+            row.appendChild(kv("DCID len", String(ip.dcid_length)));
+            row.appendChild(kv("SCID len", String(ip.scid_length)));
+            row.appendChild(kv("UDP datagram", ip.udp_datagram_size + " B"));
+            ipHost.appendChild(row);
+            ipHost.appendChild(mk("p", "text-xs text-gray-500", "The library-chosen shape of your QUIC Initial — what a passive decryptor (finch) reads and a mimic (uQUIC) forges. User-space, so spoofable; useful for telling browser families apart, not for beating evasion."));
+          } else {
+            ipHost.classList.add("hidden");
+          }
+        }
+
+        // 2) Build-flow diagram: first-flight → 4 segments → assembled QOSF.
+        const flow = d.getElementById("qosf-flow");
+        if (flow) {
+          flow.innerHTML = "";
+          const arrow = () => {
+            const a = mk("div", "text-center text-gray-400 my-1", "↓");
+            a.style.fontSize = "20px";
+            return a;
+          };
+          const top = mk("div", "mx-auto text-center font-bold px-4 py-2 rounded-md");
+          top.style.cssText =
+            "max-width:340px;border:2px solid #6b7280;background:rgba(107,114,128,.10)";
+          top.textContent = "Your QUIC first-flight · UDP :443";
+          flow.appendChild(top);
+          flow.appendChild(arrow());
+          const segCard = (s) => {
+            const c = mk("div", "rounded-md p-3");
+            c.style.cssText =
+              "flex:1 1 195px;min-width:185px;max-width:255px;border:1px solid " +
+              s.color +
+              ";border-left:5px solid " +
+              s.color +
+              ";background:" +
+              s.color +
+              "14";
+            const head = mk("div", "flex items-center gap-2 mb-1");
+            const b = mk("span", "text-white text-xs font-bold px-2 py-0.5 rounded", s.badge);
+            b.style.background = s.color;
+            head.appendChild(b);
+            head.appendChild(mk("span", "font-bold text-sm", s.name));
+            c.appendChild(head);
+            const v = mk("p", "font-mono break-all text-sm mb-1", qosf[s.key] || "—");
+            v.style.color = s.color;
+            c.appendChild(v);
+            c.appendChild(mk("p", "text-xs text-gray-500", s.source));
+            return c;
+          };
+          // Group the four segment cards into two space zones: kernel (A) | user (B/C/D).
+          const zone = (spaceKey) => {
+            const meta = QOSF_SPACE[spaceKey];
+            const z = mk("div", "rounded-md p-2");
+            z.style.cssText = "border:1.5px dashed " + meta.color + ";background:" + meta.color + "08";
+            const zh = mk("div", "text-center font-bold text-sm");
+            zh.style.color = meta.color;
+            zh.textContent = meta.title;
+            z.appendChild(zh);
+            z.appendChild(mk("div", "text-center text-xs text-gray-500 mb-2", meta.sub));
+            const inner = mk("div", "flex flex-wrap gap-3 justify-center");
+            QOSF_SEG.filter((s) => s.space === spaceKey).forEach((s) => inner.appendChild(segCard(s)));
+            z.appendChild(inner);
+            return z;
+          };
+          const zones = mk("div", "flex flex-wrap gap-4 justify-center items-start");
+          zones.appendChild(zone("kernel"));
+          zones.appendChild(zone("user"));
+          flow.appendChild(zones);
+          flow.appendChild(arrow());
+          const bot = mk("div", "mx-auto text-center px-4 py-2 rounded-md font-mono break-all", qosf.qosf);
+          bot.style.cssText =
+            "max-width:900px;border:2px solid #6b7280;background:rgba(107,114,128,.10);font-weight:700";
+          flow.appendChild(bot);
+        }
+
+        // 3) Per-field breakdown, grouped by segment.
+        const grid = d.getElementById("qosf-fields");
+        if (grid) {
+          grid.innerHTML = "";
+          const byName = {};
+          (qosf.fields || []).forEach((f) => (byName[f.name] = f));
+          QOSF_SEG.forEach((s) => {
+            const card = mk("div", "bg-gray-100 dark:bg-gray-900 rounded-md shadow p-3 m-2");
+            card.style.cssText = "flex:1 1 300px;min-width:280px;border-top:3px solid " + s.color;
+            const h = mk("div", "flex items-center gap-2 mb-2 flex-wrap");
+            const b = mk("span", "text-white text-xs font-bold px-2 py-0.5 rounded", s.badge);
+            b.style.background = s.color;
+            h.appendChild(b);
+            h.appendChild(mk("span", "font-bold", s.name));
+            const spMeta = QOSF_SPACE[s.space];
+            if (spMeta) {
+              const sp = mk("span", "text-xs px-1.5 py-0.5 rounded", s.space === "kernel" ? "kernel space" : "user space");
+              sp.style.cssText = "background:" + spMeta.color + "22;color:" + spMeta.color;
+              h.appendChild(sp);
+            }
+            card.appendChild(h);
+            if (s.key === "seg_tp_set") {
+              const chips = mk("div", "flex flex-wrap gap-1 mb-2");
+              (qosf.seg_tp_set || "").split(".").filter(Boolean).forEach((tok) => {
+                const chip = mk("span", "font-mono text-xs px-1.5 py-0.5 rounded", tok === "G" ? "G (GREASE)" : tok);
+                chip.style.cssText = "background:" + s.color + "1f;color:" + s.color;
+                chips.appendChild(chip);
+              });
+              card.appendChild(chips);
+              card.appendChild(mk("p", "text-xs text-gray-500", "The QUIC transport-parameter IDs the client sent, sorted ascending; reserved-GREASE (id%31==27) collapsed to a single G."));
+            } else {
+              (QOSF_SEG_FIELDS[s.key] || []).forEach((name) => {
+                const f = byName[name];
+                const st = qosfStatus(f);
+                const rowEl = mk("div", "mb-2");
+                const line = mk("div", "flex items-center gap-2 flex-wrap");
+                const dot = mk("span", null, "");
+                dot.style.cssText = "width:9px;height:9px;border-radius:50%;display:inline-block;background:" + st.color;
+                line.appendChild(dot);
+                line.appendChild(mk("span", "font-bold text-sm", name));
+                const val = mk("span", "font-mono text-sm", "= " + (f ? f.value : "—"));
+                val.style.color = s.color;
+                line.appendChild(val);
+                const badge = mk("span", "text-xs px-1.5 rounded", st.label);
+                badge.style.cssText = "background:" + st.color + "22;color:" + st.color;
+                line.appendChild(badge);
+                rowEl.appendChild(line);
+                if (f && f.note) rowEl.appendChild(mk("div", "text-xs italic text-gray-500 ml-4", f.note));
+                rowEl.appendChild(mk("div", "text-xs text-gray-500 ml-4", QOSF_FIELD_DOC[name] || ""));
+                card.appendChild(rowEl);
+              });
+            }
+            grid.appendChild(card);
+          });
+        }
+      };
+
+      // --- QUIC transport-param image, by client stack (Blueprint reference) ---
+      // Three REAL captures from one macOS machine: the QUIC image fingerprints
+      // the library (Chromium / Apple / neqo), NOT the OS. 16 slots × 9 bits.
+      const BP_QUIC_STACKS = [
+        { name: "Chrome", sub: "Chromium QUIC", color: "#378ADD",
+          ja4: "q13d0313h3_55b375c5d22e_226f3f127bbe",
+          bits: "111000101110000101101110000111100000111100000111100000100100100100100111000000000000000000000000000000000000100000000110000001000000000100000000" },
+        { name: "Safari", sub: "Apple Network.framework", color: "#D85A30",
+          ja4: "q13d0311h3_55b375c5d22e_0e9637bee5d3",
+          bits: "000000000000000000110000001110100000110100000110100000000000000100100111000000000000000000000000000100000000100000000000000000000000000000000000" },
+        { name: "Firefox", sub: "neqo (Mozilla)", color: "#7F77DD",
+          ja4: "q13d0315h3_55b375c5d22e_dc5437974b47",
+          bits: "111000101000000000100000001101000000110010000110010000100100100100100100000000000100010100000000000100001000100000000110000000000000000100000000" },
+      ];
+      const bpQuicSvg = (bits, color) => {
+        const C = 15, N = 12, S = N * C;
+        let r = "";
+        for (let i = 0; i < 144 && i < bits.length; i++)
+          if (bits[i] === "1") r += `<rect x="${(i % N) * C}" y="${Math.floor(i / N) * C}" width="${C}" height="${C}" fill="${color}"/>`;
+        return `<svg width="${S}" height="${S}" viewBox="0 0 ${S} ${S}" style="background:#fafafa;border:1px solid #e5e7eb;border-radius:4px;display:block">${r}</svg>`;
+      };
+      const renderQuicStacks = () => {
+        const host = document.getElementById("bp-quic-stacks");
+        if (!host) return;
+        const cards = BP_QUIC_STACKS.map((s) => {
+          const set = (s.bits.match(/1/g) || []).length;
+          return `<div style="border:1px solid #e5e7eb;border-top:3px solid ${s.color};border-radius:10px;padding:10px;background:#fff;min-width:200px">
+            <div style="font-weight:bold;color:${s.color}">${s.name}</div>
+            <div style="font-size:11px;color:#9aa0a6;margin-bottom:6px">${s.sub}</div>
+            ${bpQuicSvg(s.bits, s.color)}
+            <div style="font-size:10px;font-family:monospace;color:#6b7280;margin-top:6px;word-break:break-all">${s.ja4}</div>
+            <div style="font-size:11px;color:${s.color};margin-top:2px">${set} / 144 bits set</div>
+          </div>`;
+        }).join("");
+        host.innerHTML = `<div style="display:flex;gap:12px;flex-wrap:wrap">${cards}</div>` +
+          `<p style="font-size:11px;color:#9aa0a6;margin-top:10px;max-width:60rem">Same Mac · same macOS · shared JA4 cipher core <span style="font-family:monospace">55b375c5d22e</span>. The images differ by ~25 of 144 bits — while a <em>same-stack</em> TCP SYN image clusters at Hamming 1–8. The QUIC image keys on the QUIC library, not the OS.</p>`;
+      };
+
+      // --- SPHBI image-matrix field maps (Blueprint tab) ---------------------
+      // How the 18 selected header bytes (144 bits) map onto the 12x12 SPHBI
+      // image: bit i -> pixel (x = i%12, y = i/12), each byte MSB-first, packed
+      // row-major. Mirrors pkg/tcp/tcp.go buildSPHBI / buildSPHBIv6 exactly.
+      const SPHBI_FIELD_COLOR = {
+        "TCP · source port": "#dc2626",
+        "TCP · destination port": "#ea580c",
+        "TCP · data offset + flags": "#ca8a04",
+        "TCP · window size": "#db2777",
+        "TCP · MSS option": "#b45309",
+        "IP · version + IHL": "#0d9488",
+        "IP · DSCP / ECN": "#0891b2",
+        "IP · total length": "#2563eb",
+        "IP · identification": "#4f46e5",
+        "IP · flags + frag-offset": "#7c3aed",
+        "IP · time-to-live (TTL)": "#0ea5e9",
+        "IP · protocol": "#475569",
+        "IPv6 · version + traffic class": "#0d9488",
+        "IPv6 · traffic class + flow label": "#0891b2",
+        "IPv6 · flow label": "#2563eb",
+        "IPv6 · payload length": "#4f46e5",
+        "IPv6 · next header": "#7c3aed",
+        "IPv6 · hop limit": "#0ea5e9",
+      };
+      // {n: field name, b: first byte index, c: byte count, layer, os: high OS signal}
+      const SPHBI_FIELD_MAP = {
+        ipv4: [
+          { n: "IP · version + IHL", b: 0, c: 1, layer: "IP" },
+          { n: "IP · DSCP / ECN", b: 1, c: 1, layer: "IP" },
+          { n: "IP · total length", b: 2, c: 2, layer: "IP" },
+          { n: "IP · identification", b: 4, c: 2, layer: "IP", os: true },
+          { n: "IP · flags + frag-offset", b: 6, c: 2, layer: "IP", os: true },
+          { n: "IP · time-to-live (TTL)", b: 8, c: 1, layer: "IP", os: true },
+          { n: "IP · protocol", b: 9, c: 1, layer: "IP" },
+          { n: "TCP · source port", b: 10, c: 2, layer: "TCP" },
+          { n: "TCP · destination port", b: 12, c: 2, layer: "TCP" },
+          { n: "TCP · data offset + flags", b: 14, c: 2, layer: "TCP", os: true },
+          { n: "TCP · window size", b: 16, c: 2, layer: "TCP", os: true },
+        ],
+        ipv6: [
+          { n: "IPv6 · version + traffic class", b: 0, c: 1, layer: "IP" },
+          { n: "IPv6 · traffic class + flow label", b: 1, c: 1, layer: "IP" },
+          { n: "IPv6 · flow label", b: 2, c: 2, layer: "IP", os: true },
+          { n: "IPv6 · payload length", b: 4, c: 2, layer: "IP" },
+          { n: "IPv6 · next header", b: 6, c: 1, layer: "IP" },
+          { n: "IPv6 · hop limit", b: 7, c: 1, layer: "IP", os: true },
+          { n: "TCP · source port", b: 8, c: 2, layer: "TCP" },
+          { n: "TCP · destination port", b: 10, c: 2, layer: "TCP" },
+          { n: "TCP · data offset + flags", b: 12, c: 2, layer: "TCP", os: true },
+          { n: "TCP · window size", b: 14, c: 2, layer: "TCP", os: true },
+          { n: "TCP · MSS option", b: 16, c: 2, layer: "TCP", os: true },
+        ],
+      };
+
+      const renderSphbiMatrix = (hostId, kind) => {
+        const host = document.getElementById(hostId);
+        if (!host) return;
+        const fields = SPHBI_FIELD_MAP[kind] || [];
+        const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+        const CELL = 27, ox = 46, oy = 42, GRID = 12 * CELL;
+
+        let labels = "", cells = "", legend = "";
+        // Row / column indices (0-11).
+        for (let i = 0; i < 12; i++) {
+          labels += `<text x="${ox + i * CELL + CELL / 2}" y="${oy - 10}" text-anchor="middle" font-size="10" fill="#9aa0a6">${i}</text>`;
+          labels += `<text x="${ox - 14}" y="${oy + i * CELL + CELL / 2}" text-anchor="middle" dominant-baseline="central" font-size="10" fill="#9aa0a6">${i}</text>`;
+        }
+        // Cells, coloured by the field whose bits land on them.
+        fields.forEach((f, fi) => {
+          const color = SPHBI_FIELD_COLOR[f.n] || "#64748b";
+          const start = f.b * 8, count = f.c * 8;
+          const span = f.c > 1 ? "bytes " + f.b + "–" + (f.b + f.c - 1) : "byte " + f.b;
+          for (let j = 0; j < count; j++) {
+            const idx = start + j;
+            const cx = ox + (idx % 12) * CELL, cy = oy + Math.floor(idx / 12) * CELL;
+            cells += `<rect x="${cx}" y="${cy}" width="${CELL}" height="${CELL}" fill="${color}" fill-opacity="0.5" stroke="#fff" stroke-width="1"><title>#${fi + 1} ${esc(f.n)} — ${span}, bits ${start}–${start + count - 1}</title></rect>`;
+            if (j === 0)
+              cells += `<text x="${cx + CELL / 2}" y="${cy + CELL / 2}" text-anchor="middle" dominant-baseline="central" font-size="11" font-weight="bold" fill="#0b1020" pointer-events="none">${fi + 1}</text>`;
+          }
+        });
+        // Legend (grouped by header layer).
+        const lx = ox + GRID + 34;
+        let ly = oy - 8, lastLayer = "";
+        fields.forEach((f, fi) => {
+          if (f.layer !== lastLayer) {
+            lastLayer = f.layer;
+            ly += 8;
+            const head = f.layer === "TCP" ? "TCP HEADER" : (kind === "ipv6" ? "IPv6 BASE HEADER" : "IPv4 HEADER");
+            legend += `<text x="${lx}" y="${ly + 9}" font-size="11" font-weight="bold" letter-spacing="1" fill="#6b7280">${head}</text>`;
+            ly += 22;
+          }
+          const color = SPHBI_FIELD_COLOR[f.n] || "#64748b";
+          const start = f.b * 8, count = f.c * 8;
+          const span = f.c > 1 ? "bytes " + f.b + "–" + (f.b + f.c - 1) : "byte " + f.b;
+          legend += `<rect x="${lx}" y="${ly}" width="14" height="14" rx="2" fill="${color}" fill-opacity="0.85"/>`;
+          legend += `<text x="${lx + 22}" y="${ly + 6}" dominant-baseline="central" font-size="12" fill="#111827">${fi + 1}. ${esc(f.n)}${f.os ? "  ★" : ""}</text>`;
+          legend += `<text x="${lx + 22}" y="${ly + 20}" dominant-baseline="central" font-size="10" fill="#9aa0a6">${span} · bits ${start}–${start + count - 1}</text>`;
+          ly += 29;
+        });
+
+        // Height covers whichever is taller — the grid or the legend column. The
+        // explanatory note is rendered as an HTML caption BELOW the SVG (not inside
+        // it) so its long lines wrap responsively and never overlap the legend.
+        const W = lx + 340, H = Math.max(oy + GRID, ly) + 12;
+        host.innerHTML =
+          `<svg viewBox="0 0 ${W} ${H}" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" style="width:100%;height:auto;display:block">` +
+          `<rect width="${W}" height="${H}" fill="#ffffff"/>` +
+          labels + cells + legend +
+          `</svg>` +
+          `<p class="text-[11px] text-gray-500 mt-2 px-1 leading-snug">144 bits = 18 header bytes, MSB-first, packed left→right then top→bottom. Addresses, checksums and TCP seq/ack are excluded. <span class="font-bold text-gray-600">★</span> = strong OS / network-stack signal.</p>`;
       };
 
       const toggleTheme = () => {
@@ -112,15 +819,1855 @@
         }
       };
 
+      // ===== Stack Analysis · live cross-layer contradiction stack ==========
+      // Everything is checked against the L7 claim (User-Agent). Lower layers are
+      // progressively harder to fake, so a lower-layer disagreement is a strong
+      // spoof signal. All heuristics; computed from THIS client's real signals.
+      const SA_DATACENTER = [
+        "amazon", "aws", "google llc", "google cloud", "gcp", "azure", "microsoft corp",
+        "digitalocean", "digital ocean", "ovh", "hetzner", "linode", "vultr", "oracle",
+        "alibaba", "tencent", "datacenter", "data center", " hosting", "cloud", "vps",
+        "leaseweb", "contabo", "scaleway", "choopa", "m247", "colocation", "dedicated",
+        "ovhcloud", "packet", "equinix", "hostwinds", "ionos", "godaddy", "namecheap",
+        "cloudflare", "fastly", "servers", "as-", "host europe",
+      ];
+
+      // Which scope produces each layer's signal — and therefore how spoofable it
+      // is: application (self-reported, free) → user space (fakeable with effort,
+      // e.g. uTLS) → kernel space (needs OS/root control) → network (needs to
+      // actually be on that network). This is the whole cross-layer thesis.
+      const SA_SCOPE = {
+        app: { label: "application · self-reported", color: "#f0533a" },
+        utls: { label: "user space · TLS library", color: "#2dd4bf" },
+        uhttp: { label: "user space · HTTP library", color: "#38bdf8" },
+        kernel: { label: "kernel space · OS", color: "#3b82f6" },
+        network: { label: "network · routing / ISP", color: "#8b5cf6" },
+      };
+
+      const saParseUA = (ua) => {
+        ua = ua || "";
+        const u = ua.toLowerCase();
+        const libs = [
+          [/python-requests/, "python-requests"], [/curl\//, "curl"], [/go-http-client/, "Go net/http"],
+          [/okhttp/, "OkHttp"], [/scrapy/, "Scrapy"], [/aiohttp/, "aiohttp"], [/httpx/, "httpx"],
+          [/node|axios/, "Node.js"], [/java\/|apache-httpclient/, "Java"], [/wget/, "wget"],
+          [/urllib/, "urllib"], [/postman/, "Postman"], [/insomnia/, "Insomnia"],
+        ];
+        for (const [re, name] of libs) if (re.test(u)) return { label: name, os: "", client: name, isBrowser: false, isLibrary: true, device: "" };
+        let os = "";
+        if (/windows nt|windows phone/.test(u)) os = "Windows";
+        else if (/cros /.test(u)) os = "ChromeOS";
+        else if (/android/.test(u)) os = "Android";
+        else if (/iphone|ipad|ipod/.test(u)) os = "iOS";
+        else if (/mac os x|macintosh/.test(u)) os = "macOS";
+        else if (/linux|x11/.test(u)) os = "Linux";
+        let br = "";
+        if (/edg\//.test(u)) br = "Edge";
+        else if (/opr\/|opera/.test(u)) br = "Opera";
+        else if (/firefox\//.test(u)) br = "Firefox";
+        else if (/chrome\/|chromium/.test(u)) br = "Chrome";
+        else if (/version\/.*safari/.test(u)) br = "Safari";
+        const device = /iphone/.test(u) ? "iPhone" : /ipad/.test(u) ? "iPad" : /android.*mobile|mobile/.test(u) ? "mobile" : "";
+        const isBrowser = !!br;
+        const label = isBrowser ? [device || os, br].filter(Boolean).join(" · ") : (os || "unrecognized client");
+        return { label, os, client: br, isBrowser, isLibrary: false, device };
+      };
+
+      // Browser-class TLS detector. GREASE is filtered from /api/all's readable
+      // ciphers, so we key on browser-only ClientHello extensions that automation
+      // libraries (requests/Go/curl/okhttp) never send: GREASE (if surfaced), ALPS
+      // (application_settings 17613, Chromium), ECH (65037), cert compression (27).
+      const saBrowserTLS = (d) => {
+        const t = d.tls || {};
+        const names = (t.extensions || []).map((e) => String((e && e.name) || e).toLowerCase());
+        const has = (sub) => names.some((n) => n.includes(sub));
+        const grease = JSON.stringify(t).toUpperCase().includes("GREASE");
+        const alps = has("application_settings") || has("17613");
+        const ech = has("encrypted_client_hello") || has("65037") || has("(ech)");
+        const compressCert = has("compress_certificate") || has(" (27)");
+        const markers = [grease && "GREASE", alps && "ALPS", ech && "ECH", compressCert && "cert-compression"].filter(Boolean);
+        return { browser: markers.length > 0, markers };
+      };
+      const saInitTTL = (ttl) => (ttl <= 0 ? 0 : ttl <= 32 ? 32 : ttl <= 64 ? 64 : ttl <= 128 ? 128 : ttl <= 255 ? 255 : 0);
+      const saTTLFamily = (ttl) => { const i = saInitTTL(ttl); return i === 128 ? "Windows" : i === 64 ? "Unix-like" : i === 255 ? "network gear" : i === 32 ? "legacy" : ""; };
+
+      // Each layer carries BOTH compared values: `expected` (what the L7 claim
+      // implies for this layer) and `actual` (what we extracted from the packets).
+      const saLayers = (d, asn) => {
+        const claim = saParseUA(d.user_agent);
+        const L = [];
+
+        // L7 — the claim itself (source of every expectation below)
+        L.push({ layer: "L7 · USER-AGENT", accent: "#f0533a", scope: SA_SCOPE.app, expected: '"' + claim.label + '"', actual: '"' + claim.label + '"',
+          evidence: d.user_agent || "—", verdict: "claim",
+          reason: "The self-reported identity — trivial to fake. Every layer below is checked against it." });
+
+        // L5-6 — TLS (browser-only ClientHello extensions are the tell)
+        const bt = saBrowserTLS(d);
+        const expTLS = claim.isBrowser ? (claim.client + "-class TLS (GREASE / ALPS / ECH / cert-compression)")
+          : claim.isLibrary ? (claim.client + " — minimal TLS, no browser extensions") : "any TLS stack";
+        const actTLS = bt.browser === true ? ("browser-class TLS (" + bt.markers.join(", ") + ")")
+          : bt.browser === false ? "non-browser TLS (no browser extensions)" : "TLS stack unrecognized";
+        let tV, tR;
+        if (claim.isBrowser) {
+          tV = bt.browser === true ? "consistent" : bt.browser === false ? "contradiction" : "unknown";
+          tR = bt.browser === true ? "Sends the browser-only TLS extensions a real " + claim.client + " sends." :
+            bt.browser === false ? "A real " + claim.client + " sends browser-only TLS extensions (GREASE, ALPS, ECH, cert-compression); this ClientHello has none — a library / automation TLS stack." :
+            "Not enough TLS data to classify the stack.";
+        } else if (claim.isLibrary) {
+          tV = bt.browser === true ? "unknown" : "consistent";
+          tR = bt.browser === true ? "A library User-Agent but browser-style TLS extensions — possible impersonation (uTLS / curl-impersonate)." : "Minimal, non-browser TLS — consistent with " + claim.client + ".";
+        } else { tV = "unknown"; tR = "No browser claimed to cross-check the TLS stack against."; }
+        L.push({ layer: "L5-6 · TLS / JA4", accent: "#2dd4bf", scope: SA_SCOPE.utls, expected: expTLS, actual: actTLS, evidence: (d.tls || {}).ja4 || d.ja4 || "—", verdict: tV, reason: tR });
+
+        // H2/H3 — framing (pseudo-header order is a per-browser tell)
+        const ak = (d.http2 || {}).akamai_fingerprint || (d.http3 || {}).akamai_fingerprint || "";
+        const order = ak ? ak.split("|").pop() : "";
+        const expOrder = { Chrome: "m,a,s,p", Edge: "m,a,s,p", Opera: "m,a,s,p", Firefox: "m,p,a,s", Safari: "m,s,a,p" }[claim.client];
+        const expFr = claim.isBrowser ? (expOrder ? (claim.client + " · pseudo-order " + expOrder) : (claim.client + " HTTP framing")) : "any (non-browser)";
+        const actFr = ak ? ("pseudo-order " + order) : "no HTTP framing captured";
+        let fV, fR;
+        if (!ak) { fV = "unknown"; fR = "No HTTP/2 (Akamai) fingerprint for this request."; }
+        else if (claim.isBrowser && expOrder) {
+          fV = order === expOrder ? "consistent" : "contradiction";
+          fR = order === expOrder ? claim.client + " sends its pseudo-headers as " + expOrder + " — matches." :
+            claim.client + " sends pseudo-headers " + expOrder + ", but this client sent " + order + " — not " + claim.client + "'s framing.";
+        } else if (claim.isBrowser) { fV = "unknown"; fR = "No reference framing recorded for " + claim.client + "."; }
+        else { fV = "unknown"; fR = "Non-browser client — framing shown for reference."; }
+        L.push({ layer: "H2 · FRAMING", accent: "#38bdf8", scope: SA_SCOPE.uhttp, expected: expFr, actual: actFr, evidence: ak || "—", verdict: fV, reason: fR });
+
+        // L3-4 — TCP/IP kernel (TTL). QUIC has no SYN → reuse the QOSF kernel signal.
+        const ttl = ((d.tcpip || {}).ip || {}).ttl || 0;
+        const expKern = claim.os ? (claim.os === "Windows" ? "Windows kernel (initial TTL 128)" : claim.os + " → Unix-like kernel (initial TTL 64)") : "any kernel";
+        let kV, kR, actKern, kEv;
+        if (ttl > 0) {
+          const fam = saTTLFamily(ttl);
+          actKern = fam + " kernel (TTL " + ttl + " → " + saInitTTL(ttl) + ")";
+          kEv = "TTL " + ttl + " · window " + (((d.tcpip || {}).tcp || {}).window || "?") + " · JA4T " + ((d.tcpip || {}).ja4t || d.ja4t || "—");
+          if (claim.os) {
+            const claimWin = claim.os === "Windows", isWin = fam === "Windows";
+            if ((fam === "Windows" || fam === "Unix-like") && claimWin !== isWin) {
+              kV = "contradiction";
+              kR = "Claims " + claim.os + " but the TCP/IP stack is " + fam + " (initial TTL " + saInitTTL(ttl) + "). The OS writing the packets is not " + claim.os + ".";
+            } else { kV = "consistent"; kR = "Kernel (" + fam + ") is compatible with the claimed " + claim.os + "."; }
+          } else { kV = "unknown"; kR = "No OS claimed to cross-check."; }
+        } else if (d.qosf && d.qosf.os) {
+          actKern = d.qosf.os.family + " kernel (QUIC TTL)";
+          kEv = "QUIC segment A · " + (d.qosf.seg_kernel || "");
+          const cv = (d.qosf.consistency || {}).verdict;
+          kV = cv === "mismatch" ? "contradiction" : cv === "consistent" ? "consistent" : "unknown";
+          kR = (d.qosf.consistency || {}).detail || "Inferred from the QUIC kernel TTL.";
+        } else { actKern = "no kernel signal captured"; kEv = "—"; kV = "unknown"; kR = "No TCP SYN or QUIC Initial kernel data for this connection."; }
+        L.push({ layer: "L3-4 · TCP/IP", accent: "#3b82f6", scope: SA_SCOPE.kernel, expected: expKern, actual: actKern, evidence: kEv, verdict: kV, reason: kR });
+
+        // L1-3 — network / ASN (datacenter vs residential)
+        const expNet = claim.isBrowser ? "residential / ISP (a real user's network)" : claim.isLibrary ? "any (automated client)" : "any network";
+        let aV, aR, actNet, aEv;
+        if (asn && asn.asn) {
+          const blob = ((asn.as_name || "") + " " + (asn.isp || "") + " " + (asn.org || "")).toLowerCase();
+          const dc = SA_DATACENTER.some((k) => blob.includes(k));
+          actNet = (dc ? "datacenter / hosting" : "residential / ISP") + " · " + (asn.as_name || asn.isp || asn.org || asn.asn);
+          aEv = [asn.asn, asn.as_name || asn.org, asn.country_code || asn.country].filter(Boolean).join(" · ");
+          if (dc && claim.isBrowser) {
+            aV = "contradiction";
+            aR = "A real " + (claim.device || claim.os || "browser") + " user — but the source is a datacenter / hosting network (" + (asn.as_name || asn.org) + "). Consumer devices browse from residential ISPs. Consistent with a bot or proxy.";
+          } else if (dc && claim.isLibrary) { aV = "consistent"; aR = "A datacenter source is consistent with an automated " + claim.client + " client."; }
+          else if (!dc) { aV = "consistent"; aR = "Residential / ISP network — consistent with a real user."; }
+          else { aV = "unknown"; aR = ""; }
+        } else { actNet = "ASN not resolved"; aEv = "—"; aV = "unknown"; aR = "Resolving the network operator…"; }
+        L.push({ layer: "L1-3 · NETWORK · ASN", accent: "#8b5cf6", scope: SA_SCOPE.network, expected: expNet, actual: actNet, evidence: aEv, verdict: aV, reason: aR });
+
+        return L;
+      };
+
+      // Render the contradiction stack into given hosts (reused by the live tab and
+      // the Previous-Clients detail pane). vHost may be null (no banner).
+      const saRenderInto = (vHost, stackHost, layers, subjectWord) => {
+        subjectWord = subjectWord || "the";
+        const contra = layers.filter((l) => l.verdict === "contradiction").length;
+        const unresolved = layers.filter((l) => l.verdict === "unknown").length;
+        if (vHost) {
+          vHost.textContent = "";
+          const vc = contra > 0 ? "#f0533a" : "#1f8a4c";
+          const banner = pcEl("div", "rounded-md p-4");
+          banner.style.cssText = "border:1px solid " + vc + ";background:" + vc + "14";
+          const bt = pcEl("div", "text-xl font-black", contra > 0 ? (contra + " CONTRADICTION" + (contra > 1 ? "S" : "") + " — the claim doesn't hold up") : "COHERENT — every resolved layer agrees with the claim");
+          bt.style.color = vc;
+          banner.appendChild(bt);
+          banner.appendChild(pcEl("p", "text-sm text-gray-500 mt-1", contra > 0 ? "A lower, harder-to-fake layer disagrees with " + subjectWord + " User-Agent." : (unresolved ? ("All resolved layers agree (" + unresolved + " unresolved).") : "User-Agent, TLS, HTTP framing, kernel and network all tell the same story.")));
+          vHost.appendChild(banner);
+        }
+        stackHost.textContent = "";
+        layers.forEach((l) => {
+          const row = pcEl("div", "rounded-md p-4 m-3 flex items-start gap-4 flex-wrap");
+          row.style.cssText = "border-left:5px solid " + l.accent + ";background:rgba(127,127,127,.06)";
+          const left = pcEl("div", "grow");
+          const labRow = pcEl("div", "flex items-center gap-2 flex-wrap mb-1");
+          const lab = pcEl("div", "font-mono text-xs font-bold tracking-wider", l.layer);
+          lab.style.color = l.accent;
+          labRow.appendChild(lab);
+          if (l.scope) {
+            // Scope chip — which layer of the machine produces this signal, and so
+            // how forgeable it is: application (self-reported, free) → user space
+            // (fakeable with effort) → kernel space (needs OS/root) → network.
+            const chip = pcEl("span", "text-[10px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded", l.scope.label);
+            chip.style.cssText = "background:" + l.scope.color + "22;color:" + l.scope.color + ";border:1px solid " + l.scope.color + "55";
+            labRow.appendChild(chip);
+          }
+          left.appendChild(labRow);
+          if (l.verdict === "claim") {
+            left.appendChild(pcEl("div", "text-lg", "says " + l.actual));
+          } else {
+            // Show BOTH values being compared: what the claim expects vs. what we observed.
+            const vc = l.verdict === "contradiction" ? "#f0533a" : l.verdict === "consistent" ? "#1f8a4c" : "#9ca3af";
+            const cmp = pcEl("div", "flex flex-wrap gap-x-8 gap-y-1");
+            const kv = (k, v, color) => {
+              const w = pcEl("div", "");
+              w.appendChild(pcEl("div", "text-[10px] uppercase tracking-wider text-gray-400", k));
+              const val = pcEl("div", "text-base");
+              val.textContent = v;
+              val.style.color = color;
+              w.appendChild(val);
+              return w;
+            };
+            cmp.appendChild(kv("claim expects", l.expected, "#9ca3af"));
+            const arrow = pcEl("div", "self-center text-gray-500", l.verdict === "contradiction" ? "≠" : l.verdict === "consistent" ? "≈" : "?");
+            cmp.appendChild(arrow);
+            cmp.appendChild(kv("observed", l.actual, vc));
+            left.appendChild(cmp);
+          }
+          left.appendChild(pcEl("div", "text-xs text-gray-500 font-mono break-all mt-1", l.evidence));
+          if (l.reason) left.appendChild(pcEl("div", "text-xs text-gray-500 mt-1 max-w-3xl", l.reason));
+          row.appendChild(left);
+          const bmap = { claim: ["THE CLAIM", "#9ca3af"], consistent: ["CONSISTENT", "#1f8a4c"], contradiction: ["CONTRADICTION", "#f0533a"], unknown: ["UNRESOLVED", "#9ca3af"] };
+          const bv = bmap[l.verdict] || bmap.unknown;
+          const badge = pcEl("div", "font-mono text-xs font-bold tracking-wider whitespace-nowrap", bv[0]);
+          badge.style.color = bv[1];
+          row.appendChild(badge);
+          stackHost.appendChild(row);
+        });
+      };
+
+      const renderStackAnalysis = () => {
+        const stackHost = document.getElementById("sa-stack");
+        const vHost = document.getElementById("sa-verdict");
+        if (!stackHost) return;
+        stackHost.textContent = "";
+        stackHost.appendChild(pcEl("p", "text-gray-500 m-3", "Analyzing your request…"));
+        Promise.all([
+          fetch("/api/all", { cache: "no-store" }).then((r) => r.json()).catch(() => ({})),
+          fetch("/api/asn", { cache: "no-store" }).then((r) => r.json()).catch(() => ({})),
+        ]).then(([d, asn]) => saRenderInto(vHost, stackHost, saLayers(d, asn), "your"));
+      };
+
+      // Build a saLayers input object from a stored Previous-Clients record, whose
+      // top-level akamai lives at d.akamai_fingerprint (not under http2/http3).
+      const saInputFromClient = (d) => ({
+        user_agent: d.user_agent,
+        http_version: d.http_version,
+        tls: d.tls || {},
+        http2: { akamai_fingerprint: d.akamai_fingerprint },
+        http3: d.http_version === "h3" ? { akamai_fingerprint: d.akamai_fingerprint } : undefined,
+        tcpip: d.tcpip,
+        ja4t: d.ja4t,
+        qosf: d.qosf,
+      });
+
+      const showTab = (name) => {
+        ["fingerprints", "sphbi", "qosf", "stackanalysis", "previousclients", "comparative", "blueprint", "visualanalysis"].forEach((t) => {
+          document
+            .getElementById("panel-" + t)
+            .classList.toggle("hidden", t !== name);
+          const btn = document.getElementById("tab-" + t);
+          const active = t === name;
+          // Historical tab amber ("not your data"); Comparative teal; Visual Analysis indigo; QOSF purple; Stack Analysis red; others blue.
+          const color =
+            t === "previousclients" ? "border-amber-500"
+              : t === "comparative" ? "border-teal-500"
+              : t === "visualanalysis" ? "border-indigo-500"
+              : t === "qosf" ? "border-purple-500"
+              : t === "stackanalysis" ? "border-red-500"
+              : "border-blue-500";
+          btn.classList.toggle(color, active);
+          btn.classList.toggle("border-transparent", !active);
+        });
+        // The single Previous-Clients filter bar is SHARED: it is physically moved
+        // into the Comparative tab while that tab is active (one source of truth, so
+        // filters stay perfectly in sync), and moved back home otherwise.
+        const bar = document.getElementById("pc-filterbar");
+        if (bar) {
+          if (name === "comparative") document.getElementById("ca-filterbar-slot").appendChild(bar);
+          else document.getElementById("pc-filterbar-home").after(bar);
+        }
+        caActive = name === "comparative";
+        if ((name === "previousclients" || name === "comparative") && !pcLoaded) {
+          pcLoaded = true;
+          pcFetchList();
+        }
+        if (name === "comparative") caFetchPool();
+        // Visual Analysis owns its own React Flow module (loaded lazily on first open).
+        if (name === "visualanalysis" && window.VA) window.VA.mount();
+        if (name === "stackanalysis") renderStackAnalysis();
+      };
+
+      // ===== Previous Clients (historical) =================================
+      // All stored values are rendered via textContent / createElement, never
+      // innerHTML interpolation, so a hostile stored User-Agent cannot execute.
+      const PC_PER = 25;
+      let pcPage = 1,
+        pcTotal = 0,
+        pcSelected = null,
+        pcLoaded = false,
+        pcSort = "last_seen",
+        pcDir = "desc",
+        pcFilterTimer = null,
+        caActive = false;
+
+      const pcEl = (tag, cls, text) => {
+        const e = document.createElement(tag);
+        if (cls) e.className = cls;
+        if (text != null) e.textContent = text;
+        return e;
+      };
+
+      const pcDrawCanvas = (canvas, bits, size) => {
+        const n = size || 12;
+        canvas.width = n;
+        canvas.height = n;
+        const ctx = canvas.getContext("2d");
+        const img = ctx.createImageData(n, n);
+        bits = bits || "";
+        for (let i = 0; i < n * n && i < bits.length; i++) {
+          const on = bits[i] === "1" ? 255 : 0;
+          img.data[i * 4] = on;
+          img.data[i * 4 + 1] = on;
+          img.data[i * 4 + 2] = on;
+          img.data[i * 4 + 3] = 255;
+        }
+        ctx.putImageData(img, 0, 0);
+      };
+
+      const pcTimeAgo = (ts) => {
+        if (!ts) return "-";
+        const diff = Math.floor(Date.now() / 1000) - ts;
+        if (diff < 60) return diff + "s ago";
+        if (diff < 3600) return Math.floor(diff / 60) + "m ago";
+        if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
+        return Math.floor(diff / 86400) + "d ago";
+      };
+
+      const pcUTC = (ts) =>
+        ts ? new Date(ts * 1000).toISOString().replace("T", " ").slice(0, 19) + " UTC" : "-";
+
+      const pcKindBadge = (kind) => {
+        const map = {
+          ipv4: ["IPv4", "bg-green-200 dark:bg-green-900 text-green-800 dark:text-green-200"],
+          ipv6: ["IPv6", "bg-cyan-200 dark:bg-cyan-900 text-cyan-800 dark:text-cyan-200"],
+          quic: ["QUIC", "bg-violet-200 dark:bg-violet-900 text-violet-800 dark:text-violet-200"],
+        };
+        const e = map[kind] || [kind || "?", "bg-gray-200 dark:bg-gray-700"];
+        return pcEl("span", "px-1.5 py-0.5 rounded text-xs font-bold " + e[1], e[0]);
+      };
+
+      // Shared filter -> query builder, reused by BOTH Previous Clients and the
+      // Comparative Analysis pool so the two tabs honor identical filter state.
+      const pcAddFilterParams = (qs) => {
+        const gv = (id) => ((document.getElementById(id) || {}).value || "").trim();
+        const kind = gv("pc-f-kind"), ipq = gv("pc-f-ip"), ja4q = gv("pc-f-ja4"), uaq = gv("pc-f-ua");
+        const qparam = gv("pc-f-qparam"), qvalue = gv("pc-f-qvalue"), asnq = gv("pc-f-asn");
+        if (kind) qs.set("kind", kind);
+        if (ipq) qs.set("ip", ipq);
+        if (ja4q) qs.set("ja4", ja4q);
+        if (uaq) qs.set("ua", uaq);
+        if (qparam) qs.set("qparam", qparam);
+        if (qvalue) qs.set("qvalue", qvalue);
+        if (asnq) qs.set("asn", asnq);
+        pcShSelected.forEach((v) => qs.append("shvalues", v));
+        if ((document.getElementById("pc-f-collected") || {}).checked) qs.set("collected", "1");
+        return qs;
+      };
+
+      const pcFetchList = () => {
+        const btn = document.getElementById("pc-refresh");
+        if (btn) btn.disabled = true;
+        pcUpdateSortIndicators();
+        const qs = new URLSearchParams({ page: pcPage, per_page: PC_PER, sort: pcSort, dir: pcDir });
+        pcAddFilterParams(qs);
+        fetch(`/api/clients?${qs.toString()}`)
+          .then((r) => r.json())
+          .then((d) => {
+            pcTotal = d.total || 0;
+            pcRenderRows(d.clients || []);
+          })
+          .catch((e) => {
+            const tb = document.getElementById("pc-tbody");
+            tb.innerHTML = "";
+            const tr = pcEl("tr");
+            const td = pcEl("td", "py-4 text-red-500", "Failed to load: " + e.message);
+            td.colSpan = 10;
+            tr.appendChild(td);
+            tb.appendChild(tr);
+          })
+          .finally(() => {
+            if (btn) btn.disabled = false;
+          });
+      };
+
+      const pcUpdateSortIndicators = () => {
+        document.querySelectorAll("#panel-previousclients th [data-sort]").forEach((s) => {
+          s.textContent = s.getAttribute("data-sort") === pcSort ? (pcDir === "desc" ? " ↓" : " ↑") : "";
+        });
+      };
+      const pcSetSort = (field) => {
+        if (pcSort === field) pcDir = pcDir === "desc" ? "asc" : "desc";
+        else {
+          pcSort = field;
+          pcDir = field === "kind" || field === "ja4" ? "asc" : "desc";
+        }
+        pcPage = 1;
+        pcFetchList();
+      };
+      const pcApplyFilters = () => {
+        clearTimeout(pcFilterTimer);
+        pcFilterTimer = setTimeout(() => {
+          pcPage = 1;
+          pcFetchList();
+          if (caActive) caFetchPool(); // shared filters -> live-update the compare pool
+        }, 250);
+      };
+      const pcClearFilters = () => {
+        ["pc-f-kind", "pc-f-ip", "pc-f-ja4", "pc-f-ua", "pc-f-qparam", "pc-f-qvalue", "pc-f-asn"].forEach((id) => {
+          const el = document.getElementById(id);
+          if (el) el.value = "";
+        });
+        const cb = document.getElementById("pc-f-collected");
+        if (cb) cb.checked = false;
+        pcShSelected.clear();
+        pcShUpdateLabel();
+        pcSort = "last_seen";
+        pcDir = "desc";
+        pcPage = 1;
+        pcFetchList();
+        if (caActive) caFetchPool();
+      };
+
+      // --- scraping-header faceted multi-select (values discovered in real time) ---
+      let pcShValues = [],
+        pcShSelected = new Set(),
+        pcShOpen = false;
+      const pcShFetch = () =>
+        fetch("/api/qvalues?param=scraping-header")
+          .then((r) => r.json())
+          .then((v) => {
+            pcShValues = Array.isArray(v) ? v : [];
+            pcShRender();
+          })
+          .catch(() => {});
+      const pcShToggle = (e) => {
+        if (e) e.stopPropagation();
+        const pn = document.getElementById("pc-sh-panel");
+        pcShOpen = !pcShOpen;
+        if (pcShOpen) {
+          pn.classList.remove("hidden");
+          pcShFetch(); // refetch each open so new values appear without a reload
+        } else {
+          pn.classList.add("hidden");
+        }
+      };
+      const pcShUpdateLabel = () => {
+        const n = pcShSelected.size;
+        const l = document.getElementById("pc-sh-label");
+        if (l) l.textContent = n === 0 ? "Any" : n + " selected";
+      };
+      const pcShRender = () => {
+        const box = document.getElementById("pc-sh-options");
+        if (!box) return;
+        const q = ((document.getElementById("pc-sh-search") || {}).value || "").toLowerCase();
+        box.innerHTML = "";
+        const vals = [...pcShValues].sort((a, b) => a.localeCompare(b)).filter((v) => !q || v.toLowerCase().includes(q));
+        if (!vals.length) {
+          box.appendChild(pcEl("div", "text-xs text-gray-400 font-normal py-1", pcShValues.length ? "no match" : "no values seen yet"));
+        }
+        vals.forEach((v) => {
+          const lab = pcEl("label", "flex items-center gap-1.5 text-xs font-normal cursor-pointer py-0.5");
+          const cb = pcEl("input", "accent-blue-500");
+          cb.type = "checkbox";
+          cb.checked = pcShSelected.has(v);
+          cb.onchange = () => {
+            if (cb.checked) pcShSelected.add(v);
+            else pcShSelected.delete(v);
+            pcShUpdateLabel();
+            pcApplyFilters();
+          };
+          lab.appendChild(cb);
+          lab.appendChild(pcEl("span", "break-all", v));
+          box.appendChild(lab);
+        });
+        pcShUpdateLabel();
+      };
+      const pcShClear = (e) => {
+        if (e) e.stopPropagation();
+        pcShSelected.clear();
+        pcShRender();
+        pcApplyFilters();
+      };
+      // Close the panel on an outside click.
+      document.addEventListener("click", (e) => {
+        if (!pcShOpen) return;
+        if (e.target.closest("#pc-sh-panel") || e.target.closest("#pc-sh-btn")) return;
+        pcShOpen = false;
+        const pn = document.getElementById("pc-sh-panel");
+        if (pn) pn.classList.add("hidden");
+      });
+
+      // --- JA4 fingerprint picker: a dropdown of the unique JA4s collected so far,
+      // feeding the same "JA4 contains" substring input. Manual typing still works;
+      // picking a fingerprint just fills the box with the full value. The list grows
+      // automatically (refetched each open) and is deduped across all clients. ---
+      let pcJa4Values = [],
+        pcJa4Open = false;
+      const pcJa4Fetch = () =>
+        fetch("/api/ja4values")
+          .then((r) => r.json())
+          .then((v) => {
+            pcJa4Values = Array.isArray(v) ? v : [];
+            pcJa4Render();
+          })
+          .catch(() => {});
+      const pcJa4Toggle = (e) => {
+        if (e) e.stopPropagation();
+        const pn = document.getElementById("pc-ja4-panel");
+        pcJa4Open = !pcJa4Open;
+        if (pcJa4Open) {
+          pn.classList.remove("hidden");
+          const s = document.getElementById("pc-ja4-search");
+          if (s) s.value = "";
+          pcJa4Fetch(); // refetch each open so newly-collected fingerprints appear
+        } else {
+          pn.classList.add("hidden");
+        }
+      };
+      const pcJa4Render = () => {
+        const box = document.getElementById("pc-ja4-options");
+        if (!box) return;
+        const q = ((document.getElementById("pc-ja4-search") || {}).value || "").toLowerCase();
+        const cur = ((document.getElementById("pc-f-ja4") || {}).value || "").trim();
+        box.innerHTML = "";
+        const vals = [...pcJa4Values].sort((a, b) => a.localeCompare(b)).filter((v) => !q || v.toLowerCase().includes(q));
+        const cnt = document.getElementById("pc-ja4-count");
+        if (cnt) cnt.textContent = pcJa4Values.length ? vals.length + " of " + pcJa4Values.length + " unique" : "";
+        if (!vals.length) {
+          box.appendChild(pcEl("div", "text-xs text-gray-400 font-normal py-1", pcJa4Values.length ? "no match" : "no fingerprints seen yet"));
+          return;
+        }
+        vals.forEach((v) => {
+          const opt = pcEl(
+            "button",
+            "block w-full text-left text-[11px] font-mono cursor-pointer py-0.5 px-1 rounded break-all hover:bg-blue-50 dark:hover:bg-blue-950 " +
+              (v === cur ? "bg-blue-100 dark:bg-blue-900 font-bold" : "")
+          );
+          opt.type = "button";
+          opt.textContent = v;
+          opt.onclick = () => {
+            const inp = document.getElementById("pc-f-ja4");
+            if (inp) inp.value = v; // fill the substring filter with the full fingerprint
+            pcJa4Open = false;
+            const pn = document.getElementById("pc-ja4-panel");
+            if (pn) pn.classList.add("hidden");
+            pcApplyFilters();
+          };
+          box.appendChild(opt);
+        });
+      };
+      const pcJa4ClearInput = (e) => {
+        if (e) e.stopPropagation();
+        const inp = document.getElementById("pc-f-ja4");
+        if (inp) inp.value = "";
+        pcJa4Render();
+        pcApplyFilters();
+      };
+      // Close the JA4 panel on an outside click.
+      document.addEventListener("click", (e) => {
+        if (!pcJa4Open) return;
+        if (e.target.closest("#pc-ja4-panel") || e.target.closest("#pc-ja4-btn")) return;
+        pcJa4Open = false;
+        const pn = document.getElementById("pc-ja4-panel");
+        if (pn) pn.classList.add("hidden");
+      });
+
+      // --- ASN picker: a dropdown of the network operators (ASNs) seen so far,
+      // feeding the "ASN" substring filter (matches the AS number OR operator name).
+      // Picking an entry fills the box with its AS number. The list grows automatically
+      // (refetched each open) and relies on the ASN cache — run "Backfill ASN" to warm it. ---
+      let pcAsnValues = [],
+        pcAsnOpen = false;
+      const pcAsnFetch = () =>
+        fetch("/api/asnvalues")
+          .then((r) => r.json())
+          .then((v) => {
+            pcAsnValues = Array.isArray(v) ? v : [];
+            pcAsnRender();
+          })
+          .catch(() => {});
+      const pcAsnToggle = (e) => {
+        if (e) e.stopPropagation();
+        const pn = document.getElementById("pc-asn-panel");
+        pcAsnOpen = !pcAsnOpen;
+        if (pcAsnOpen) {
+          pn.classList.remove("hidden");
+          const s = document.getElementById("pc-asn-search");
+          if (s) s.value = "";
+          pcAsnFetch(); // refetch each open so newly-seen ASNs appear
+        } else {
+          pn.classList.add("hidden");
+        }
+      };
+      const pcAsnRender = () => {
+        const box = document.getElementById("pc-asn-options");
+        if (!box) return;
+        const q = ((document.getElementById("pc-asn-search") || {}).value || "").toLowerCase();
+        const cur = ((document.getElementById("pc-f-asn") || {}).value || "").trim();
+        box.innerHTML = "";
+        const vals = [...pcAsnValues].sort((a, b) => a.localeCompare(b)).filter((v) => !q || v.toLowerCase().includes(q));
+        const cnt = document.getElementById("pc-asn-count");
+        if (cnt) cnt.textContent = pcAsnValues.length ? vals.length + " of " + pcAsnValues.length + " seen" : "";
+        if (!vals.length) {
+          box.appendChild(pcEl("div", "text-xs text-gray-400 font-normal py-1", pcAsnValues.length ? "no match" : "no ASNs cached yet — run “Backfill ASN”"));
+          return;
+        }
+        vals.forEach((v) => {
+          const asn = (v.split(" · ")[0] || v).trim(); // the AS number, for the substring box
+          const opt = pcEl(
+            "button",
+            "block w-full text-left text-[11px] cursor-pointer py-0.5 px-1 rounded break-all hover:bg-blue-50 dark:hover:bg-blue-950 " +
+              (asn === cur ? "bg-blue-100 dark:bg-blue-900 font-bold" : "")
+          );
+          opt.type = "button";
+          opt.textContent = v;
+          opt.onclick = () => {
+            const inp = document.getElementById("pc-f-asn");
+            if (inp) inp.value = asn; // fill the substring filter with the AS number
+            pcAsnOpen = false;
+            const pn = document.getElementById("pc-asn-panel");
+            if (pn) pn.classList.add("hidden");
+            pcApplyFilters();
+          };
+          box.appendChild(opt);
+        });
+      };
+      const pcAsnClearInput = (e) => {
+        if (e) e.stopPropagation();
+        const inp = document.getElementById("pc-f-asn");
+        if (inp) inp.value = "";
+        pcAsnRender();
+        pcApplyFilters();
+      };
+      // Close the ASN panel on an outside click.
+      document.addEventListener("click", (e) => {
+        if (!pcAsnOpen) return;
+        if (e.target.closest("#pc-asn-panel") || e.target.closest("#pc-asn-btn")) return;
+        pcAsnOpen = false;
+        const pn = document.getElementById("pc-asn-panel");
+        if (pn) pn.classList.add("hidden");
+      });
+
+      // --- Password-gated deletion (single client + wipe all) ---
+      let pcDeletePw = null;
+      const pcGetPw = () => {
+        if (!pcDeletePw) pcDeletePw = (prompt("Enter the delete password:") || "").trim() || null;
+        return pcDeletePw;
+      };
+      const pcClearDetail = () => {
+        pcSelected = null;
+        const c = document.getElementById("pc-detail-content");
+        if (c) { c.classList.add("hidden"); c.innerHTML = ""; }
+        const e = document.getElementById("pc-detail-empty");
+        if (e) e.classList.remove("hidden");
+      };
+      const pcDeleteErr = (d) => {
+        if (d && d.error) {
+          if (/forbidden/i.test(d.error)) { pcDeletePw = null; alert("Wrong delete password."); }
+          else alert("Delete failed: " + d.error);
+          return true;
+        }
+        return false;
+      };
+      const pcDeleteClient = (key, ev) => {
+        if (ev) ev.stopPropagation();
+        const pw = pcGetPw();
+        if (!pw) return;
+        if (!confirm("Permanently delete this client and all of its records?")) return;
+        fetch("/api/client/delete?key=" + encodeURIComponent(key), {
+          method: "POST",
+          headers: { "X-Delete-Password": pw },
+        })
+          .then((r) => r.json())
+          .then((d) => {
+            if (pcDeleteErr(d)) return;
+            if (pcSelected === key) pcClearDetail();
+            pcFetchList();
+          })
+          .catch((e) => alert("Delete failed: " + e.message));
+      };
+      const pcDeleteAll = () => {
+        const pw = pcGetPw();
+        if (!pw) return;
+        if (!confirm("Permanently delete ALL " + pcTotal + " client records? This cannot be undone.")) return;
+        if (!confirm("Final confirmation — wipe the entire client history?")) return;
+        fetch("/api/clients/delete_all", { method: "POST", headers: { "X-Delete-Password": pw } })
+          .then((r) => r.json())
+          .then((d) => {
+            if (pcDeleteErr(d)) return;
+            alert("Deleted " + (d.deleted_keys || 0) + " records. History cleared.");
+            pcClearDetail();
+            pcPage = 1;
+            pcFetchList();
+          })
+          .catch((e) => alert("Delete failed: " + e.message));
+      };
+      // Warm the ASN cache for every stored client IP (admin op, same password).
+      const pcBackfillASN = () => {
+        const pw = pcGetPw();
+        if (!pw) return;
+        fetch("/api/asn/backfill", { method: "POST", headers: { "X-Delete-Password": pw } })
+          .then((r) => r.json())
+          .then((d) => {
+            if (pcDeleteErr(d)) return;
+            alert(
+              "ASN backfill started: " + (d.scheduled || 0) + " IP(s) queued (" +
+                (d.already_cached || 0) + " already cached of " + (d.total_ips || 0) +
+                " total). It runs in the background — reopen clients shortly to see cached ASN."
+            );
+          })
+          .catch((e) => alert("Backfill failed: " + e.message));
+      };
+
+      let pcLeafletP = null,
+        pcMap = null;
+      const pcLoadLeaflet = () => {
+        if (window.L) return Promise.resolve();
+        if (pcLeafletP) return pcLeafletP;
+        pcLeafletP = new Promise((resolve, reject) => {
+          const css = document.createElement("link");
+          css.rel = "stylesheet";
+          css.href = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
+          document.head.appendChild(css);
+          const js = document.createElement("script");
+          js.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+          js.onload = resolve;
+          js.onerror = reject;
+          document.head.appendChild(js);
+        });
+        return pcLeafletP;
+      };
+      const pcRenderMap = (geo) => {
+        const div = document.getElementById("pc-map");
+        if (!div) return;
+        const pts = (geo || []).filter(
+          (g) => typeof g.lat === "number" && typeof g.lon === "number"
+        );
+        if (!pts.length) {
+          div.style.height = "auto";
+          div.innerHTML =
+            '<div class="p-4 text-sm text-gray-500">No geolocation available for this client’s IP(s).</div>';
+          return;
+        }
+        pcLoadLeaflet()
+          .then(() => {
+            if (pcMap) {
+              try { pcMap.remove(); } catch (e) {}
+              pcMap = null;
+            }
+            pcMap = L.map(div, { scrollWheelZoom: false }).setView([pts[0].lat, pts[0].lon], 4);
+            L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", {
+              maxZoom: 19,
+              attribution: "© OpenStreetMap © CARTO",
+            }).addTo(pcMap);
+            const markers = pts.map((p) =>
+              L.circleMarker([p.lat, p.lon], {
+                radius: 7,
+                color: "#b91c1c",
+                weight: 2,
+                fillColor: "#ef4444",
+                fillOpacity: 0.85,
+              })
+                .addTo(pcMap)
+                .bindPopup("<b>" + p.ip + "</b><br>" + [p.city, p.country].filter(Boolean).join(", "))
+            );
+            pcMap.fitBounds(L.featureGroup(markers).getBounds().pad(0.3), { maxZoom: 8 });
+            setTimeout(() => { if (pcMap) pcMap.invalidateSize(); }, 60);
+          })
+          .catch(() => {
+            div.style.height = "auto";
+            div.innerHTML = '<div class="p-4 text-sm text-red-500">Map failed to load.</div>';
+          });
+      };
+
+      const pcRenderRows = (clients) => {
+        const tb = document.getElementById("pc-tbody");
+        tb.innerHTML = "";
+        if (!clients.length) {
+          const tr = pcEl("tr");
+          const td = pcEl("td", "py-6 text-center text-gray-500", "No previous clients recorded yet.");
+          td.colSpan = 10;
+          tr.appendChild(td);
+          tb.appendChild(tr);
+        }
+        clients.forEach((c) => {
+          const sphbi = c.sphbi || {};
+          const tr = pcEl(
+            "tr",
+            "cursor-pointer border-b border-gray-200 dark:border-gray-800 hover:bg-gray-100 dark:hover:bg-gray-700/50"
+          );
+          tr.id = "pc-row-" + c.client_key;
+          if (c.client_key === pcSelected) tr.classList.add("bg-amber-100", "dark:bg-amber-950/40");
+          tr.onclick = () => pcSelect(c.client_key);
+
+          const tdImg = pcEl("td", "py-1.5 pr-2");
+          const cv = pcEl("canvas", "border border-gray-300 dark:border-gray-600");
+          cv.width = 12;
+          cv.height = 12;
+          cv.style.cssText = "image-rendering:pixelated;width:28px;height:28px";
+          tdImg.appendChild(cv);
+          tr.appendChild(tdImg);
+          if (sphbi.bits) pcDrawCanvas(cv, sphbi.bits, sphbi.size);
+
+          const tdKey = pcEl("td", "py-1.5 pr-2 font-mono text-xs");
+          tdKey.appendChild(pcEl("span", "", (c.client_key || "").slice(0, 10) + "…"));
+          if (c.collected) {
+            const badge = pcEl(
+              "span",
+              "ml-1 px-1 rounded text-[10px] font-bold bg-amber-200 dark:bg-amber-700 text-amber-900 dark:text-amber-100 align-middle",
+              "REQ " + c.collected
+            );
+            badge.title = c.collected + " captured request parameter set(s)";
+            tdKey.appendChild(badge);
+          }
+          tdKey.title = c.client_key || "";
+          tr.appendChild(tdKey);
+
+          const tdKind = pcEl("td", "py-1.5 pr-2");
+          tdKind.appendChild(pcKindBadge(sphbi.kind));
+          tr.appendChild(tdKind);
+
+          tr.appendChild(pcEl("td", "py-1.5 pr-2 text-xs text-gray-500", pcTimeAgo(c.last_seen)));
+          tr.appendChild(pcEl("td", "py-1.5 pr-2 text-right text-xs", String(c.visit_count || 0)));
+          tr.appendChild(pcEl("td", "py-1.5 pr-2 text-right text-xs text-gray-500", String(c.ip_count || 0)));
+
+          const tdIP = pcEl("td", "py-1.5 pr-2 font-mono text-xs text-gray-500", c.ip || "—");
+          tdIP.title = c.ip || "";
+          tr.appendChild(tdIP);
+
+          const tdJa4 = pcEl("td", "py-1.5 pr-2 font-mono text-xs text-gray-500", (c.ja4 || "").slice(0, 18));
+          tdJa4.title = c.ja4 || "";
+          tr.appendChild(tdJa4);
+
+          const ua = c.user_agent || "";
+          const tdUA = pcEl("td", "py-1.5 text-xs text-gray-500", ua ? ua.slice(0, 38) + (ua.length > 38 ? "…" : "") : "—");
+          tdUA.title = ua;
+          tr.appendChild(tdUA);
+
+          const tdDel = pcEl("td", "py-1.5 pl-1 text-right");
+          const delBtn = pcEl("button", "text-gray-400 hover:text-red-600 px-1 font-bold leading-none", "✕");
+          delBtn.title = "Delete this client";
+          delBtn.onclick = (e) => pcDeleteClient(c.client_key, e);
+          tdDel.appendChild(delBtn);
+          tr.appendChild(tdDel);
+
+          tb.appendChild(tr);
+        });
+
+        const start = (pcPage - 1) * PC_PER + 1;
+        const end = Math.min(pcPage * PC_PER, pcTotal);
+        document.getElementById("pc-page-info").textContent = pcTotal
+          ? `Showing ${start}–${end} of ${pcTotal}`
+          : "No clients";
+        document.getElementById("pc-prev").disabled = pcPage <= 1;
+        document.getElementById("pc-next").disabled = end >= pcTotal;
+      };
+
+      const pcSelect = (key) => {
+        if (pcSelected) {
+          const prev = document.getElementById("pc-row-" + pcSelected);
+          if (prev) prev.classList.remove("bg-amber-100", "dark:bg-amber-950/40");
+        }
+        pcSelected = key;
+        const cur = document.getElementById("pc-row-" + key);
+        if (cur) cur.classList.add("bg-amber-100", "dark:bg-amber-950/40");
+
+        document.getElementById("pc-detail-empty").classList.add("hidden");
+        const content = document.getElementById("pc-detail-content");
+        content.classList.remove("hidden");
+        content.innerHTML = "";
+        content.appendChild(pcEl("p", "text-gray-500 py-6", "Loading…"));
+        if (window.innerWidth < 1024) content.scrollIntoView({ behavior: "smooth" });
+
+        fetch(`/api/client?key=${encodeURIComponent(key)}`)
+          .then((r) => r.json())
+          .then(pcRenderDetail)
+          .catch((e) => {
+            content.innerHTML = "";
+            content.appendChild(pcEl("p", "text-red-500 py-6", "Failed: " + e.message));
+          });
+      };
+
+      // Decode a base64 body to text for display (binary-safe; invalid UTF-8 ->
+      // U+FFFD). Truncates the displayed string so a large body can't bloat the DOM.
+      const pcDecodeB64 = (b64, maxChars) => {
+        try {
+          const bin = atob(b64);
+          const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+          let s = new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+          if (maxChars && s.length > maxChars)
+            s = s.slice(0, maxChars) + "\n… (" + (s.length - maxChars) + " more chars)";
+          return s;
+        } catch (e) {
+          return "(unable to decode body)";
+        }
+      };
+
+      // Look up the ASN (network operator) for each of a client's IPs via the
+      // server-side cached /api/asn endpoint, rendering a small table.
+      const pcFillASN = (container, ips) => {
+        const uniq = [...new Set(ips || [])].slice(0, 8);
+        if (!uniq.length) {
+          container.innerHTML = "";
+          container.appendChild(pcEl("div", "text-gray-500", "No IPs to look up."));
+          return;
+        }
+        Promise.all(
+          uniq.map((ip) =>
+            fetch("/api/asn?ip=" + encodeURIComponent(ip))
+              .then((r) => r.json())
+              .catch(() => ({ ip }))
+          )
+        )
+          .then((infos) => {
+            container.innerHTML = "";
+            const t = pcEl("table", "table-auto text-xs w-full");
+            const hr = pcEl("tr", "text-left text-gray-500 border-b border-gray-300 dark:border-gray-700");
+            ["IP", "ASN", "Operator", "Country"].forEach((h) => hr.appendChild(pcEl("th", "pr-3 py-1", h)));
+            t.appendChild(hr);
+            infos.forEach((a) => {
+              const tr = pcEl("tr", "border-b border-gray-200 dark:border-gray-800");
+              tr.appendChild(pcEl("td", "pr-3 py-1 font-mono break-all", a.ip || "-"));
+              tr.appendChild(pcEl("td", "pr-3 py-1 font-mono", a.asn || "—"));
+              const op = pcEl("td", "pr-3 py-1", a.as_name || a.org || a.isp || "—");
+              if (a.isp || a.org) op.title = [a.isp, a.org].filter(Boolean).join(" / ");
+              tr.appendChild(op);
+              tr.appendChild(pcEl("td", "pr-3 py-1", a.country_code || a.country || "—"));
+              t.appendChild(tr);
+            });
+            container.appendChild(t);
+          })
+          .catch(() => {
+            container.innerHTML = "";
+            container.appendChild(pcEl("div", "text-gray-500", "ASN lookup unavailable."));
+          });
+      };
+
+      // Exact Hamming k-NN: the closest other SPHBI images to this client, fetched
+      // from /api/client/similar. Each neighbor is a clickable thumbnail that jumps
+      // the detail pane to that client (pcSelect). Distance is colored by closeness.
+      const pcDistClass = (d) =>
+        d <= 8
+          ? "bg-green-200 dark:bg-green-900 text-green-800 dark:text-green-200"
+          : d <= 24
+          ? "bg-yellow-200 dark:bg-yellow-900 text-yellow-800 dark:text-yellow-200"
+          : "bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-300";
+
+      const pcFillSimilar = (container, key) => {
+        fetch("/api/client/similar?key=" + encodeURIComponent(key) + "&n=12")
+          .then((r) => r.json())
+          .then((d) => {
+            container.innerHTML = "";
+            const nbs = (d && d.neighbors) || [];
+            if (!nbs.length) {
+              container.appendChild(pcEl("div", "text-gray-500 text-xs", "No other clients share this image kind yet."));
+              return;
+            }
+            container.appendChild(
+              pcEl(
+                "div",
+                "text-[11px] text-gray-500 mb-2",
+                nbs.length + " closest " + (d.kind || "") + " image" + (nbs.length === 1 ? "" : "s") + " by Hamming distance (0 = identical, 144 = opposite)"
+              )
+            );
+            const grid = pcEl("div", "flex flex-wrap gap-2");
+            nbs.forEach((nb) => {
+              const cell = pcEl("button", "flex flex-col items-center gap-1 p-1.5 rounded border border-gray-200 dark:border-gray-700 hover:border-teal-400");
+              cell.title = (nb.user_agent || "") + "\n" + (nb.client_key || "");
+              cell.onclick = () => pcSelect(nb.client_key);
+              const cv = pcEl("canvas", "border border-gray-300 dark:border-gray-600");
+              cv.style.cssText = "image-rendering:pixelated;width:48px;height:48px";
+              cell.appendChild(cv);
+              if (nb.sphbi && nb.sphbi.bits) pcDrawCanvas(cv, nb.sphbi.bits, nb.sphbi.size);
+              cell.appendChild(
+                pcEl("span", "px-1.5 py-0.5 rounded text-[10px] font-bold font-mono " + pcDistClass(nb.distance), "d=" + nb.distance)
+              );
+              cell.appendChild(pcEl("span", "text-[10px] text-gray-500", nb.similarity + "% match"));
+              grid.appendChild(cell);
+            });
+            container.appendChild(grid);
+          })
+          .catch(() => {
+            container.innerHTML = "";
+            container.appendChild(pcEl("div", "text-gray-500 text-xs", "Similarity lookup unavailable."));
+          });
+      };
+
+      // Render the trusted-collection request(s) captured on this client's
+      // connections: method, target, query, headers, and decoded body.
+      const pcRenderRequests = (conns) => {
+        const reqConns = (conns || []).filter((cn) => cn.request);
+        if (!reqConns.length) return null;
+        const rdet = pcEl("details", "mt-3 mx-2 rounded-md border-2 border-amber-400 dark:border-amber-600");
+        rdet.open = true;
+        rdet.appendChild(
+          pcEl(
+            "summary",
+            "px-4 py-2 cursor-pointer text-sm font-bold text-amber-700 dark:text-amber-300",
+            "Captured request parameters (" + reqConns.length + ")"
+          )
+        );
+        const rwrap = pcEl("div", "px-4 py-3 space-y-4");
+        reqConns.forEach((cn) => {
+          const r = cn.request || {};
+          const card = pcEl("div", "rounded border border-gray-300 dark:border-gray-700 p-3 bg-gray-50 dark:bg-gray-900");
+
+          const head = pcEl("div", "flex items-center gap-2 mb-2 flex-wrap");
+          head.appendChild(
+            pcEl("span", "px-2 py-0.5 rounded text-xs font-bold bg-amber-200 dark:bg-amber-800 text-amber-900 dark:text-amber-100", r.method || "-")
+          );
+          head.appendChild(pcEl("span", "font-mono text-xs break-all", r.target || "-"));
+          if (cn.ts)
+            head.appendChild(
+              pcEl("span", "text-xs text-gray-500 ml-auto", new Date(cn.ts * 1000).toISOString().replace("T", " ").slice(0, 19))
+            );
+          card.appendChild(head);
+
+          // Query parameters.
+          const q = r.query || {};
+          const qk = Object.keys(q);
+          if (qk.length) {
+            card.appendChild(pcEl("h4", "font-bold text-xs text-gray-500 mt-2 mb-1 uppercase", "Query parameters"));
+            const qt = pcEl("table", "table-auto text-xs w-full");
+            qk.forEach((k) => {
+              (q[k] || []).forEach((val) => {
+                const tr = pcEl("tr", "border-b border-gray-200 dark:border-gray-800");
+                tr.appendChild(pcEl("td", "pr-3 py-0.5 font-mono text-amber-700 dark:text-amber-300 align-top", k));
+                tr.appendChild(pcEl("td", "py-0.5 font-mono break-all", String(val)));
+                qt.appendChild(tr);
+              });
+            });
+            card.appendChild(qt);
+          }
+
+          // Headers (collapsed by default).
+          const hs = r.headers || [];
+          if (hs.length) {
+            const hdet = pcEl("details", "mt-2");
+            hdet.appendChild(pcEl("summary", "cursor-pointer text-xs font-bold text-gray-500 uppercase", "Request headers (" + hs.length + ")"));
+            hdet.appendChild(
+              pcEl("pre", "text-xs font-mono whitespace-pre-wrap break-all mt-1 text-gray-700 dark:text-gray-300", hs.join("\n"))
+            );
+            card.appendChild(hdet);
+          }
+
+          // Body.
+          if (r.body_b64) {
+            card.appendChild(
+              pcEl(
+                "h4",
+                "font-bold text-xs text-gray-500 mt-2 mb-1 uppercase",
+                "Body · " + (r.body_bytes || 0) + " bytes" + (r.content_type ? " · " + r.content_type : "") + (r.truncated ? " · TRUNCATED" : "")
+              )
+            );
+            card.appendChild(
+              pcEl(
+                "pre",
+                "text-xs font-mono whitespace-pre-wrap break-all max-h-60 overflow-auto p-2 rounded bg-gray-100 dark:bg-gray-800",
+                pcDecodeB64(r.body_b64, 16384)
+              )
+            );
+          } else if (r.body_bytes) {
+            card.appendChild(pcEl("p", "text-xs text-gray-500 mt-2", "Body: " + r.body_bytes + " bytes (empty/not shown)"));
+          }
+
+          rwrap.appendChild(card);
+        });
+        rdet.appendChild(rwrap);
+        return rdet;
+      };
+
+      // --- Drag-to-reorder detail sections (order persisted per browser) ---
+      const PC_SECTION_ORDER_KEY = "pcSectionOrder";
+      const PC_SECTION_LABELS = {
+        identity: "Identity & image",
+        stackanalysis: "Stack Analysis (contradiction stack)",
+        fingerprints: "Fingerprints",
+        similar: "Similar clients (SPHBI)",
+        asn: "ASN · network operator",
+        query: "URL query parameters",
+        requests: "Captured request parameters",
+        map: "Geolocation map",
+        connections: "Connection history",
+        network: "Network details",
+        quic: "QUIC parameters",
+      };
+      let pcDragSec = null;
+      const pcLoadSectionOrder = () => {
+        try { return JSON.parse(localStorage.getItem(PC_SECTION_ORDER_KEY)) || []; } catch (e) { return []; }
+      };
+      const pcSaveSectionOrder = () => {
+        const c = document.getElementById("pc-detail-content");
+        if (!c) return;
+        const order = [...c.querySelectorAll(":scope > .pc-section")].map((s) => s.dataset.section);
+        try { localStorage.setItem(PC_SECTION_ORDER_KEY, JSON.stringify(order)); } catch (e) {}
+      };
+      const pcResetSectionOrder = () => {
+        try { localStorage.removeItem(PC_SECTION_ORDER_KEY); } catch (e) {}
+        if (pcSelected) pcSelect(pcSelected);
+      };
+      const pcClearDropMarks = () =>
+        document.querySelectorAll(".pc-section").forEach((s) => s.classList.remove("pc-drop-before", "pc-drop-after"));
+      // Wrap a section node with a drag handle + drop behavior.
+      const pcSectionWrap = (key, node) => {
+        const sec = document.createElement("div");
+        sec.className = "pc-section mt-2";
+        sec.dataset.section = key;
+        const handle = pcEl(
+          "span",
+          "pc-drag-handle absolute right-1 top-1 z-10 px-1.5 py-0.5 rounded text-sm leading-none text-gray-400 bg-white/70 dark:bg-gray-800/70 hover:text-amber-600 dark:hover:text-amber-400",
+          "⠿"
+        );
+        handle.title = "Drag to reorder · " + (PC_SECTION_LABELS[key] || key);
+        handle.setAttribute("draggable", "true");
+        handle.addEventListener("dragstart", (e) => {
+          pcDragSec = sec;
+          sec.classList.add("pc-dragging");
+          e.dataTransfer.effectAllowed = "move";
+          try { e.dataTransfer.setData("text/plain", key); } catch (_) {}
+          try { e.dataTransfer.setDragImage(sec, 24, 16); } catch (_) {}
+        });
+        handle.addEventListener("dragend", () => {
+          sec.classList.remove("pc-dragging");
+          pcClearDropMarks();
+          pcDragSec = null;
+          pcSaveSectionOrder();
+          if (pcMap) setTimeout(() => { try { pcMap.invalidateSize(); } catch (_) {} }, 80);
+        });
+        sec.appendChild(handle);
+        sec.appendChild(node);
+        sec.addEventListener("dragover", (e) => {
+          if (!pcDragSec || pcDragSec === sec) return;
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "move";
+          const r = sec.getBoundingClientRect();
+          const before = e.clientY - r.top < r.height / 2;
+          sec.classList.toggle("pc-drop-before", before);
+          sec.classList.toggle("pc-drop-after", !before);
+        });
+        sec.addEventListener("dragleave", (e) => {
+          if (!sec.contains(e.relatedTarget)) sec.classList.remove("pc-drop-before", "pc-drop-after");
+        });
+        sec.addEventListener("drop", (e) => {
+          if (!pcDragSec || pcDragSec === sec) return;
+          e.preventDefault();
+          const r = sec.getBoundingClientRect();
+          const before = e.clientY - r.top < r.height / 2;
+          sec.parentNode.insertBefore(pcDragSec, before ? sec : sec.nextSibling);
+          sec.classList.remove("pc-drop-before", "pc-drop-after");
+        });
+        return sec;
+      };
+      // Append section nodes honoring the saved order; unknown/new keys keep their
+      // default relative position at the end.
+      const pcAppendSections = (content, sections) => {
+        const present = {};
+        sections.forEach(([k, node]) => (present[k] = pcSectionWrap(k, node)));
+        const used = new Set();
+        pcLoadSectionOrder().forEach((k) => {
+          if (present[k]) { content.appendChild(present[k]); used.add(k); }
+        });
+        sections.forEach(([k]) => {
+          if (!used.has(k)) content.appendChild(present[k]);
+        });
+      };
+
+      const pcRenderDetail = (d) => {
+        const content = document.getElementById("pc-detail-content");
+        content.innerHTML = "";
+        const sphbi = d.sphbi || {};
+        const sections = [];
+
+        const hdr = pcEl(
+          "div",
+          "flex items-center gap-3 mb-3 pb-3 border-b border-gray-300 dark:border-gray-700 flex-wrap"
+        );
+        hdr.appendChild(
+          pcEl(
+            "span",
+            "px-2 py-0.5 rounded text-xs font-bold bg-amber-200 dark:bg-amber-800 text-amber-900 dark:text-amber-100 uppercase tracking-widest",
+            "Historical"
+          )
+        );
+        hdr.appendChild(pcEl("span", "font-mono text-xs break-all text-gray-600 dark:text-gray-300", d.client_key || ""));
+        hdr.appendChild(pcEl("span", "ml-auto text-xs text-gray-400", "Drag ⠿ to reorder"));
+        const resetBtn = pcEl("button", "text-xs text-gray-500 hover:text-amber-600 underline decoration-dotted", "↺ reset");
+        resetBtn.title = "Reset section order to default";
+        resetBtn.onclick = pcResetSectionOrder;
+        hdr.appendChild(resetBtn);
+        const delClientBtn = pcEl("button", "text-xs font-bold text-red-600 hover:text-white hover:bg-red-600 border border-red-400 rounded px-2 py-0.5", "🗑 Delete client");
+        delClientBtn.title = "Permanently delete this client";
+        delClientBtn.onclick = () => pcDeleteClient(d.client_key);
+        hdr.appendChild(delClientBtn);
+        content.appendChild(hdr);
+
+        // Primary: SPHBI image directly beside identifying info.
+        const primary = pcEl("div", "flex flex-wrap items-start gap-3");
+
+        const imgCard = pcEl("div", "bg-gray-100 dark:bg-gray-900 rounded-md shadow p-4");
+        imgCard.appendChild(
+          pcEl(
+            "h3",
+            "font-bold mb-2 text-sm",
+            "Binary image · " + ((sphbi.packet_type || "") + (sphbi.kind ? " · " + sphbi.kind.toUpperCase() : "") || "-")
+          )
+        );
+        const cv = pcEl("canvas", "border border-gray-400 dark:border-gray-600");
+        cv.width = 12;
+        cv.height = 12;
+        cv.style.cssText = "image-rendering:pixelated;width:240px;height:240px";
+        imgCard.appendChild(cv);
+        imgCard.appendChild(pcEl("p", "text-xs mt-2 text-gray-500", "12×12 · white=1 · black=0"));
+        const hexP = pcEl("p", "text-xs mt-1 font-mono text-gray-500 break-all", sphbi.hex || "");
+        hexP.style.maxWidth = "240px";
+        imgCard.appendChild(hexP);
+        primary.appendChild(imgCard);
+        if (sphbi.bits) pcDrawCanvas(cv, sphbi.bits, sphbi.size);
+
+        const infoCard = pcEl("div", "bg-gray-100 dark:bg-gray-900 rounded-md shadow p-4 grow min-w-[220px]");
+        infoCard.appendChild(pcEl("h3", "font-bold mb-3 text-sm text-amber-700 dark:text-amber-300", "Identifying information"));
+        const grid = pcEl("div", "grid grid-cols-2 gap-x-4 gap-y-1 text-sm");
+        const addKV = (k, v) => {
+          grid.appendChild(pcEl("div", "text-gray-500", k));
+          grid.appendChild(pcEl("div", "break-all", v == null || v === "" ? "-" : String(v)));
+        };
+        addKV("First seen", pcUTC(d.first_seen));
+        addKV("Last seen", pcUTC(d.last_seen));
+        addKV("Visits", d.visit_count || 0);
+        addKV("Distinct IPs", d.ip_count || 0);
+        addKV("Kind", sphbi.kind || "-");
+        addKV("HTTP", d.http_version || "-");
+        infoCard.appendChild(grid);
+        infoCard.appendChild(pcEl("div", "text-gray-500 text-sm mt-2", "User-Agent"));
+        infoCard.appendChild(pcEl("div", "text-xs break-words font-mono", d.user_agent || "-"));
+
+        const fLabel =
+          sphbi.kind === "quic"
+            ? "Transport-param slots"
+            : sphbi.kind === "ipv6"
+            ? "IPv6 + TCP + MSS bytes"
+            : "TCP/IPv4 header bytes";
+        infoCard.appendChild(pcEl("h4", "font-bold text-xs text-gray-500 mt-3 mb-1 uppercase", fLabel));
+        const fTable = pcEl("table", "table-auto text-xs w-full");
+        (sphbi.fields || []).forEach((f) => {
+          const tr = pcEl("tr", "border-b border-gray-200 dark:border-gray-800");
+          tr.appendChild(pcEl("td", "pr-3 py-0.5", f.name));
+          tr.appendChild(pcEl("td", "pr-3 py-0.5 text-gray-500", String(f.bytes)));
+          tr.appendChild(pcEl("td", "font-mono", f.hex));
+          fTable.appendChild(tr);
+        });
+        infoCard.appendChild(fTable);
+        primary.appendChild(infoCard);
+        sections.push(["identity", primary]);
+
+        // TLS / network fingerprint cards.
+        const fps = pcEl("div", "flex flex-wrap mt-1");
+        const fpCard = (title, big, small) => {
+          const c = pcEl("div", "bg-gray-100 dark:bg-gray-900 rounded-md shadow p-3 m-2 grow min-w-fit max-w-full");
+          c.appendChild(pcEl("h3", "font-bold text-xs text-gray-500 mb-1", title));
+          c.appendChild(pcEl("p", "text-base break-all font-mono", big || "-"));
+          if (small != null) c.appendChild(pcEl("p", "text-xs break-all text-gray-500 font-mono", small || ""));
+          return c;
+        };
+        fps.appendChild(fpCard("JA3", d.ja3_hash, d.ja3));
+        fps.appendChild(fpCard("JA4 / JA4_r", d.ja4, d.ja4_r));
+        fps.appendChild(fpCard("JA4T · TCP client", d.ja4t || (d.tcpip && d.tcpip.ja4t), null));
+        fps.appendChild(fpCard(d.http_version === "h3" ? "Akamai h3" : "Akamai h2", d.akamai_fingerprint_hash, d.akamai_fingerprint));
+        fps.appendChild(fpCard("PeetPrint", d.peetprint_hash, d.peetprint));
+        sections.push(["fingerprints", fps]);
+
+        // Stack Analysis — the cross-layer contradiction stack for THIS stored client.
+        const saWrap = pcEl("div", "mt-1 mx-2 rounded-md border border-gray-300 dark:border-gray-700 pb-2");
+        saWrap.appendChild(pcEl("div", "px-4 py-2 text-sm font-bold", "Stack Analysis · contradiction stack"));
+        const saVerdict = pcEl("div", "px-3 pt-1");
+        const saStack = pcEl("div", "");
+        saStack.appendChild(pcEl("div", "text-gray-500 text-xs px-4 py-2", "Analyzing this client's layers…"));
+        saWrap.appendChild(saVerdict);
+        saWrap.appendChild(saStack);
+        sections.push(["stackanalysis", saWrap]);
+        // Resolve the ASN for the client's primary IP (observed → allowed), then render.
+        const saIp = (d.ips || [])[0];
+        const saInput = saInputFromClient(d);
+        const saGo = (asn) => saRenderInto(saVerdict, saStack, saLayers(saInput, asn || {}), "this client's");
+        if (saIp) {
+          fetch("/api/asn?ip=" + encodeURIComponent(saIp), { cache: "no-store" }).then((r) => r.json()).then(saGo).catch(() => saGo({}));
+        } else { saGo({}); }
+
+        // Similar clients by SPHBI image (exact Hamming k-NN) — populated async.
+        if (d.sphbi && d.sphbi.bits) {
+          const simWrap = pcEl("div", "mt-1 mx-2 rounded-md border border-gray-300 dark:border-gray-700");
+          simWrap.appendChild(pcEl("div", "px-4 py-2 text-sm font-bold", "Similar clients · closest SPHBI images"));
+          const simBody = pcEl("div", "px-4 py-3");
+          simBody.appendChild(pcEl("div", "text-gray-500 text-xs", "Finding similar images…"));
+          simWrap.appendChild(simBody);
+          sections.push(["similar", simWrap]);
+          pcFillSimilar(simBody, d.client_key);
+        }
+
+        // ASN / network operator per IP — populated async via /api/asn.
+        const asnWrap = pcEl("div", "mt-1 mx-2 rounded-md border border-gray-300 dark:border-gray-700");
+        asnWrap.appendChild(pcEl("div", "px-4 py-2 text-sm font-bold", "ASN · network operator"));
+        const asnBody = pcEl("div", "px-4 py-3 text-xs");
+        asnBody.appendChild(pcEl("div", "text-gray-500", "Looking up…"));
+        asnWrap.appendChild(asnBody);
+        sections.push(["asn", asnWrap]);
+        pcFillASN(asnBody, d.ips);
+
+        // URL query parameters — parsed from this client's per-request paths (any
+        // protocol, no trusted header needed). This is what shows a normal visit's
+        // "?dee=money". The page's own /api/ calls are skipped as noise. Keys with no
+        // corresponding value (e.g. "?foo" or "?foo=") are omitted.
+        const qrows = [];
+        (d.recent_paths || []).forEach((rp) => {
+          const p = rp.path || "";
+          if (p.indexOf("/api/") === 0) return;
+          const qi = p.indexOf("?");
+          if (qi < 0) return;
+          try {
+            new URLSearchParams(p.slice(qi + 1)).forEach((v, k) => {
+              if (v !== "") qrows.push({ k, v, ts: rp.ts, path: p });
+            });
+          } catch (e) {}
+        });
+        if (qrows.length) {
+          const qWrap = pcEl("div", "mt-1 mx-2 rounded-md border-2 border-blue-400 dark:border-blue-600");
+          qWrap.appendChild(pcEl("div", "px-4 py-2 text-sm font-bold text-blue-700 dark:text-blue-300", "URL query parameters (" + qrows.length + ")"));
+          const qt = pcEl("table", "w-full text-xs table-auto");
+          const qh = pcEl("tr", "text-left text-gray-500 border-b border-gray-300 dark:border-gray-700");
+          ["Param", "Value", "Path", "When"].forEach((h) => qh.appendChild(pcEl("th", "px-3 py-1", h)));
+          qt.appendChild(qh);
+          qrows.slice(0, 100).forEach((q) => {
+            const tr = pcEl("tr", "border-b border-gray-200 dark:border-gray-800");
+            tr.appendChild(pcEl("td", "px-3 py-1 font-mono font-bold text-blue-700 dark:text-blue-300", q.k));
+            tr.appendChild(pcEl("td", "px-3 py-1 font-mono break-all", q.v));
+            const pt = pcEl("td", "px-3 py-1 font-mono text-gray-500 break-all", q.path);
+            pt.title = q.path;
+            tr.appendChild(pt);
+            tr.appendChild(pcEl("td", "px-3 py-1 text-gray-500 whitespace-nowrap", q.ts ? new Date(q.ts * 1000).toISOString().replace("T", " ").slice(0, 19) : "-"));
+            qt.appendChild(tr);
+          });
+          qWrap.appendChild(qt);
+          sections.push(["query", qWrap]);
+        }
+
+        // Captured request parameters (trusted-collection only).
+        const reqEl = pcRenderRequests(d.connections);
+        if (reqEl) sections.push(["requests", reqEl]);
+
+        // IP geolocation map (where this client's requests originate).
+        const geoPts = d.geo || [];
+        const mapWrap = pcEl(
+          "div",
+          "mt-3 mx-2 rounded-md border border-gray-300 dark:border-gray-700 overflow-hidden"
+        );
+        mapWrap.appendChild(
+          pcEl("div", "px-4 py-2 text-sm font-bold", "Where this client connects from (" + geoPts.length + " located)")
+        );
+        const mapDiv = pcEl("div");
+        mapDiv.id = "pc-map";
+        mapDiv.style.height = "320px";
+        mapWrap.appendChild(mapDiv);
+        sections.push(["map", mapWrap]);
+
+        // Connection history.
+        const conns = d.connections || [];
+        const cdet = pcEl("details", "mt-3 mx-2 rounded-md border border-gray-300 dark:border-gray-700");
+        cdet.appendChild(pcEl("summary", "px-4 py-2 cursor-pointer text-sm font-bold", "Connection history (" + conns.length + ")"));
+        const cTable = pcEl("table", "w-full text-xs table-auto");
+        const chead = pcEl("tr", "text-left text-gray-500 border-b border-gray-300 dark:border-gray-700");
+        ["Time", "HTTP", "ClientRandom", "Path"].forEach((h) => chead.appendChild(pcEl("th", "px-3 py-1", h)));
+        cTable.appendChild(chead);
+        conns.forEach((cn) => {
+          const tr = pcEl("tr", "border-b border-gray-200 dark:border-gray-800");
+          tr.appendChild(pcEl("td", "px-3 py-1 font-mono", cn.ts ? new Date(cn.ts * 1000).toISOString().replace("T", " ").slice(0, 19) : "-"));
+          tr.appendChild(pcEl("td", "px-3 py-1", cn.http_version || "-"));
+          const crTd = pcEl("td", "px-3 py-1 font-mono text-gray-500", (cn.client_random || "").slice(0, 16) + ((cn.client_random || "").length > 16 ? "…" : ""));
+          crTd.title = cn.client_random || "";
+          tr.appendChild(crTd);
+          const pTd = pcEl("td", "px-3 py-1 text-gray-500", cn.path || "/");
+          pTd.title = cn.path || "";
+          tr.appendChild(pTd);
+          cTable.appendChild(tr);
+        });
+        cdet.appendChild(cTable);
+        sections.push(["connections", cdet]);
+
+        // Network details + IPs/ports seen.
+        const tcpip = d.tcpip || {},
+          tcp = tcpip.tcp || {},
+          ip = tcpip.ip || {};
+        const ndet = pcEl("details", "mt-2 mx-2 rounded-md border border-gray-300 dark:border-gray-700");
+        ndet.appendChild(pcEl("summary", "px-4 py-2 cursor-pointer text-sm font-bold", "Network details & IPs/ports seen"));
+        const ng = pcEl("div", "px-4 py-3 text-xs grid grid-cols-2 gap-x-6 gap-y-1");
+        const nKV = (k, v) => {
+          ng.appendChild(pcEl("div", "text-gray-500", k));
+          ng.appendChild(pcEl("div", "font-mono break-all", v == null || v === "" ? "-" : String(v)));
+        };
+        nKV("IPs seen", (d.ips || []).join(", "));
+        nKV("Ports", (d.ports || []).join(", "));
+        nKV("TTL", ip.ttl);
+        nKV("TCP MSS", tcp.mss);
+        nKV("Window", tcp.window);
+        nKV("Options order", tcp.options_order);
+        ndet.appendChild(ng);
+        sections.push(["network", ndet]);
+
+        // QUIC transport parameters.
+        const qp = (d.tls && d.tls.quic_transport_parameters) || [];
+        if (sphbi.kind === "quic" && qp.length) {
+          const qdet = pcEl("details", "mt-2 mx-2 rounded-md border border-gray-300 dark:border-gray-700");
+          qdet.appendChild(pcEl("summary", "px-4 py-2 cursor-pointer text-sm font-bold text-amber-700 dark:text-amber-300", "QUIC transport parameters"));
+          const qt = pcEl("table", "w-full text-xs table-auto");
+          qp.forEach((p) => {
+            const tr = pcEl("tr", "border-b border-gray-200 dark:border-gray-800");
+            tr.appendChild(pcEl("td", "px-3 py-1", p.name || "0x" + (p.id || 0).toString(16)));
+            tr.appendChild(pcEl("td", "px-3 py-1 font-mono text-gray-500", p.value || "-"));
+            qt.appendChild(tr);
+          });
+          qdet.appendChild(qt);
+          sections.push(["quic", qdet]);
+        }
+
+        // Wrap each section with a drag handle and append in the saved order.
+        pcAppendSections(content, sections);
+        // Render the map now that #pc-map sits in its final position.
+        pcRenderMap(geoPts);
+        // Auto-expand every collapsible section by default.
+        content.querySelectorAll("details").forEach((x) => (x.open = true));
+      };
+
+      const pcChangePage = (delta) => {
+        const max = Math.ceil(pcTotal / PC_PER) || 1;
+        const np = pcPage + delta;
+        if (np < 1 || np > max) return;
+        pcPage = np;
+        pcFetchList();
+      };
+
+      const pcRefresh = () => {
+        pcPage = 1;
+        pcFetchList();
+      };
+
+      // ===== Comparative Analysis ==========================================
+      // Pool = clients matching the (shared) Previous-Clients filters that have an
+      // SPHBI image. Selecting images shows them side by side, with pairwise Hamming
+      // distance (the research-backed similarity metric) for same-kind selections.
+      let caPool = [];
+      let caGroups = null; // when "unique per scraping-header" is on: [{value, clients:[…]}]; else null (flat pool)
+      const caSelected = new Map(); // client_key -> client {sphbi, user_agent, ...}
+
+      const caHamming = (a, b) => {
+        let d = 0;
+        const n = Math.min(a.length, b.length);
+        for (let i = 0; i < n; i++) if (a[i] !== b[i]) d++;
+        return d + Math.abs(a.length - b.length);
+      };
+
+      const caFetchPool = () => {
+        if ((document.getElementById("ca-unique-sh") || {}).checked) {
+          caFetchPoolGrouped();
+          return;
+        }
+        caGroups = null; // flat mode
+        const qs = new URLSearchParams({ page: 1, per_page: 100, sort: "last_seen", dir: "desc" });
+        pcAddFilterParams(qs);
+        const grid = document.getElementById("ca-pool");
+        if (grid) {
+          grid.innerHTML = "";
+          grid.appendChild(pcEl("div", "col-span-full text-gray-500 text-sm py-4", "Loading pool…"));
+        }
+        fetch(`/api/clients?${qs.toString()}`)
+          .then((r) => r.json())
+          .then((d) => {
+            caPool = (d.clients || []).filter((c) => c.sphbi && c.sphbi.bits);
+            const info = document.getElementById("ca-pool-info");
+            if (info)
+              info.textContent =
+                caPool.length +
+                " image" +
+                (caPool.length === 1 ? "" : "s") +
+                ((d.total || 0) > 100 ? " (first 100 of " + d.total + " — refine filters)" : "");
+            caRenderPool();
+          })
+          .catch((e) => {
+            if (grid) {
+              grid.innerHTML = "";
+              grid.appendChild(pcEl("div", "col-span-full text-red-500 py-4", "Failed: " + e.message));
+            }
+          });
+      };
+
+      // "Unique images per scraping-header group": a SINGLE server-side pass
+      // (/api/sphbi/grouped) returns every group's images already de-duplicated by
+      // distinct SPHBI image (kind+bits). This replaces the old approach of one
+      // /api/clients request PER scraping-header value (which re-scanned the whole
+      // client set each time — O(values x clients) over N round-trips). The shared
+      // filter bar still applies (kind/ip/ja4/ua/qparam/qvalue/collected); when
+      // specific scraping-header values are selected we just show those groups.
+      const CA_MAX_GROUPS = 50;
+      const caFetchPoolGrouped = async () => {
+        const grid = document.getElementById("ca-pool");
+        const info = document.getElementById("ca-pool-info");
+        if (grid) {
+          grid.innerHTML = "";
+          grid.appendChild(pcEl("div", "col-span-full text-gray-500 text-sm py-4", "Loading grouped pool…"));
+        }
+        try {
+          // One request. The server scans once and groups + dedupes.
+          const qs = new URLSearchParams({ cap: CA_MAX_GROUPS });
+          pcAddFilterParams(qs);
+          // shvalues (the selected scraping-header values) are now sent to the server:
+          // when a selection is active the server returns exactly those groups and the
+          // cap=CA_MAX_GROUPS truncation is bypassed, so a selected value whose group
+          // sorts past rank 50 can no longer be silently dropped. With no selection the
+          // server caps to the first CA_MAX_GROUPS groups and sets truncated.
+          const d = await fetch(`/api/sphbi/grouped?${qs.toString()}`).then((r) => r.json());
+
+          let groups = (d.groups || [])
+            .map((g) => ({
+              value: g.value,
+              total: g.total != null ? g.total : (g.clients || []).length, // true distinct count
+              clients: (g.clients || [])
+                .filter((c) => c.sphbi && c.sphbi.bits)
+                .map((c) => Object.assign({}, c, { _shGroup: g.value })), // tag for the tray "category"
+            }))
+            .filter((g) => g.clients.length);
+
+          // If the user selected specific scraping-header values, show only those groups.
+          if (pcShSelected.size) groups = groups.filter((g) => pcShSelected.has(g.value));
+
+          caGroups = groups;
+          caPool = caGroups.flatMap((g) => g.clients);
+
+          if (!caGroups.length) {
+            if (grid) {
+              grid.innerHTML = "";
+              grid.appendChild(pcEl("div", "col-span-full text-gray-500 text-sm py-6",
+                "No scraping-header groups match — send traffic with ?scraping-header=… first."));
+            }
+            if (info) info.textContent = "";
+            return;
+          }
+          if (info)
+            info.textContent =
+              caPool.length +
+              " unique image" +
+              (caPool.length === 1 ? "" : "s") +
+              " across " +
+              caGroups.length +
+              " group" +
+              (caGroups.length === 1 ? "" : "s") +
+              (d.truncated ? " (first " + CA_MAX_GROUPS + " groups)" : "");
+          caRenderPool();
+        } catch (e) {
+          if (grid) {
+            grid.innerHTML = "";
+            grid.appendChild(pcEl("div", "col-span-full text-red-500 py-4", "Failed: " + e.message));
+          }
+        }
+      };
+
+      // One selectable pool thumbnail. Shared by the flat and grouped renderers.
+      const caCell = (c) => {
+        const sel = caSelected.has(c.client_key);
+        const cell = pcEl(
+          "button",
+          "relative flex flex-col items-center gap-1 p-1.5 rounded border " +
+            (sel
+              ? "border-teal-500 ring-2 ring-teal-400 bg-teal-50 dark:bg-teal-950/40"
+              : "border-gray-200 dark:border-gray-700 hover:border-teal-400")
+        );
+        cell.title = c.user_agent || "";
+        cell.onclick = () => caToggle(c);
+        const cv = pcEl("canvas", "border border-gray-300 dark:border-gray-600");
+        cv.style.cssText = "image-rendering:pixelated;width:48px;height:48px";
+        cell.appendChild(cv);
+        pcDrawCanvas(cv, c.sphbi.bits, c.sphbi.size);
+        cell.appendChild(pcKindBadge(c.sphbi.kind));
+        if (sel) cell.appendChild(pcEl("span", "absolute -top-1 -right-1 bg-teal-500 text-white text-[10px] leading-none px-1 py-0.5 rounded-full", "✓"));
+        return cell;
+      };
+
+      const caRenderPool = () => {
+        const grid = document.getElementById("ca-pool");
+        if (!grid) return;
+        grid.innerHTML = "";
+        // Grouped (unique-per-scraping-header) mode: a labeled header per group.
+        if (caGroups) {
+          if (!caGroups.length) {
+            grid.appendChild(pcEl("div", "col-span-full text-gray-500 text-sm py-6", "No images match the current filters."));
+            return;
+          }
+          caGroups.forEach((g) => {
+            const hdr = pcEl(
+              "div",
+              "col-span-full mt-2 mb-0.5 text-xs font-bold text-teal-700 dark:text-teal-300 border-b border-teal-200 dark:border-teal-800 pb-0.5"
+            );
+            const shown = g.clients.length, total = g.total != null ? g.total : shown;
+            hdr.textContent = "scraping-header = " + g.value + "  ·  " + total + " unique" +
+              (shown < total ? " (showing " + shown + ")" : "");
+            grid.appendChild(hdr);
+            g.clients.forEach((c) => grid.appendChild(caCell(c)));
+          });
+          return;
+        }
+        // Flat mode.
+        if (!caPool.length) {
+          grid.appendChild(pcEl("div", "col-span-full text-gray-500 text-sm py-6", "No images match the current filters."));
+          return;
+        }
+        caPool.forEach((c) => grid.appendChild(caCell(c)));
+      };
+
+      // The "category" of a selected image is its scraping-header value(s). In grouped
+      // mode the client already knows the group it was picked from (_shGroup). For a
+      // flat-mode pick we derive it from the client's recent request paths.
+      const caCategoryCache = {}; // client_key -> [values] resolved | "pending"
+
+      const caScrapingHeadersFromPaths = (paths) => {
+        const out = new Set();
+        (paths || []).forEach((p) => {
+          const path = (p && p.path) || "";
+          const qi = path.indexOf("?");
+          if (qi < 0) return;
+          try {
+            new URLSearchParams(path.slice(qi + 1)).getAll("scraping-header").forEach((v) => {
+              if (v) out.add(v);
+            });
+          } catch (e) {}
+        });
+        return [...out];
+      };
+
+      // Resolve c._categories (array of scraping-header values). Sync when known;
+      // otherwise fetch the client once and re-render the tray when it lands.
+      const caResolveCategories = (c) => {
+        if (Array.isArray(c._categories)) return;
+        if (c._shGroup) {
+          c._categories = [c._shGroup]; // the group it was selected from IS its category
+          return;
+        }
+        const key = c.client_key;
+        const cached = caCategoryCache[key];
+        if (Array.isArray(cached)) {
+          c._categories = cached;
+          return;
+        }
+        if (cached === "pending") return;
+        caCategoryCache[key] = "pending";
+        fetch("/api/client?key=" + encodeURIComponent(key))
+          .then((r) => r.json())
+          .then((d) => {
+            const vals = caScrapingHeadersFromPaths(d.recent_paths);
+            caCategoryCache[key] = vals;
+            c._categories = vals;
+            caRenderTray();
+          })
+          .catch(() => {
+            caCategoryCache[key] = [];
+            c._categories = [];
+            caRenderTray();
+          });
+      };
+
+      const caToggle = (c) => {
+        if (caSelected.has(c.client_key)) caSelected.delete(c.client_key);
+        else {
+          caSelected.set(c.client_key, c);
+          caResolveCategories(c);
+        }
+        caRenderPool();
+        caRenderTray();
+      };
+
+      const caClear = () => {
+        caSelected.clear();
+        caRenderPool();
+        caRenderTray();
+      };
+
+      const caRenderTray = () => {
+        const tray = document.getElementById("ca-tray");
+        if (!tray) return;
+        tray.innerHTML = "";
+        const items = [...caSelected.values()];
+        const cnt = document.getElementById("ca-count");
+        if (cnt) cnt.textContent = items.length ? "(" + items.length + " selected)" : "";
+        if (!items.length) {
+          tray.appendChild(pcEl("div", "text-gray-500 text-sm py-10 text-center", "Select images from the pool to compare them side by side."));
+          return;
+        }
+        const row = pcEl("div", "flex flex-wrap gap-3 items-start");
+        items.forEach((c, i) => {
+          caResolveCategories(c); // ensure the scraping-header category is (being) resolved
+          // Category (scraping-header) display text. null = still resolving. Shown in
+          // full — long values wrap across multiple lines rather than being truncated.
+          const catVals = Array.isArray(c._categories) ? c._categories : null;
+          const catFull = catVals === null ? "resolving…" : catVals.length ? catVals.join(", ") : "no scraping-header";
+
+          const card = pcEl("div", "flex flex-col items-center gap-1 p-2 rounded border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 w-36");
+          card.appendChild(pcEl("div", "text-[10px] font-bold text-gray-400", "#" + (i + 1)));
+          const cv = pcEl("canvas", "border border-gray-400 dark:border-gray-600 cursor-pointer");
+          cv.style.cssText = "image-rendering:pixelated;width:120px;height:120px";
+          cv.title = "Click to show category (scraping-header)";
+          card.appendChild(cv);
+          pcDrawCanvas(cv, c.sphbi.bits, c.sphbi.size);
+
+          // Click-to-reveal category banner (the scraping-header value this image belongs to).
+          const banner = pcEl("div", "hidden w-full mt-1 px-1.5 py-1 rounded bg-teal-100 dark:bg-teal-900 text-teal-800 dark:text-teal-100 text-center break-all");
+          banner.appendChild(pcEl("div", "font-bold uppercase tracking-wide text-[9px] opacity-70", "Category"));
+          banner.appendChild(pcEl("div", "font-bold text-[10px] break-all", catFull));
+          cv.onclick = () => banner.classList.toggle("hidden");
+          card.appendChild(banner);
+
+          card.appendChild(pcKindBadge(c.sphbi.kind));
+          // Always-visible category chip — full value, wraps onto multiple lines.
+          const chip = pcEl(
+            "div",
+            "text-[10px] text-teal-700 dark:text-teal-300 text-center break-all leading-tight w-full",
+            "🏷 " + catFull
+          );
+          chip.title = "Category (scraping-header): " + catFull;
+          card.appendChild(chip);
+
+          const ua = pcEl("div", "text-[10px] text-gray-500 text-center break-words leading-tight", (c.user_agent || "-").slice(0, 50));
+          ua.title = c.user_agent || "";
+          card.appendChild(ua);
+          card.appendChild(pcEl("div", "text-[10px] font-mono text-gray-400 break-all", (c.client_key || "").slice(0, 10) + "…"));
+          const rm = pcEl("button", "text-[10px] text-red-500 hover:text-red-700", "✕ remove");
+          rm.onclick = () => caToggle(c);
+          card.appendChild(rm);
+          row.appendChild(card);
+        });
+        tray.appendChild(row);
+
+        if (items.length >= 2) {
+          const m = pcEl("div", "mt-4");
+          m.appendChild(pcEl("div", "text-xs font-bold text-gray-500 mb-1", "Pairwise Hamming distance (bits differing, of 144)"));
+          if (!items.every((c) => c.sphbi.kind === items[0].sphbi.kind)) {
+            m.appendChild(pcEl("div", "text-xs text-amber-600", "Selected images are different kinds (ipv4/ipv6/quic) — not directly comparable."));
+          } else {
+            const t = pcEl("table", "text-xs border-collapse");
+            const hr = pcEl("tr", "");
+            hr.appendChild(pcEl("th", "p-1", ""));
+            items.forEach((_, j) => hr.appendChild(pcEl("th", "p-1 font-mono text-gray-500", "#" + (j + 1))));
+            t.appendChild(hr);
+            items.forEach((a, i) => {
+              const tr = pcEl("tr", "");
+              tr.appendChild(pcEl("th", "p-1 font-mono text-gray-500 text-right", "#" + (i + 1)));
+              items.forEach((b, j) => {
+                const d = i === j ? -1 : caHamming(a.sphbi.bits, b.sphbi.bits);
+                const cls = i === j ? "text-gray-300" : d <= 8 ? "text-green-600 font-bold" : d <= 24 ? "text-yellow-600" : "text-gray-500";
+                tr.appendChild(pcEl("td", "p-1 text-center font-mono " + cls, i === j ? "–" : String(d)));
+              });
+              t.appendChild(tr);
+            });
+            m.appendChild(t);
+            m.appendChild(pcEl("div", "text-[10px] text-gray-400 mt-1", "Lower = more similar (same network stack). Green ≤8, yellow ≤24."));
+          }
+          tray.appendChild(m);
+        }
+      };
+
       const track = () => insert(/*DATA*/)
     </script>
   </head>
 
   <body class="m-5 dark:bg-gray-800 dark:text-gray-50" onload="track()">
+    <div class="mb-2">
+      <span class="text-gray-500 dark:text-gray-400 text-sm">Your IP address:</span>
+      <span id="client-ip" class="font-mono font-bold break-all">Loading...</span>
+      <span class="text-gray-500 dark:text-gray-400 text-sm ml-3">ASN:</span>
+      <span id="client-asn" class="font-mono font-bold break-all text-sm">…</span>
+    </div>
     <h1 class="text-4xl mb-3 font-black">TrackMe - fingerprinting API</h1>
 
-    <h2 class="text-2xl pt-5">Your fingerprints</h2>
-    <hr class="pb-5" />
+    <div class="flex gap-2 mb-4 border-b border-gray-300 dark:border-gray-700">
+      <button
+        id="tab-fingerprints"
+        onclick="showTab('fingerprints')"
+        class="px-4 py-2 font-bold border-b-2 border-blue-500"
+      >
+        Fingerprints
+      </button>
+      <button
+        id="tab-sphbi"
+        onclick="showTab('sphbi')"
+        class="px-4 py-2 font-bold border-b-2 border-transparent"
+      >
+        SPHBI · Packet Image
+      </button>
+      <button
+        id="tab-qosf"
+        onclick="showTab('qosf')"
+        class="px-4 py-2 font-bold border-b-2 border-transparent"
+      >
+        QOSF · QUIC OS
+      </button>
+      <button
+        id="tab-stackanalysis"
+        onclick="showTab('stackanalysis')"
+        class="px-4 py-2 font-bold border-b-2 border-transparent"
+      >
+        Stack Analysis
+      </button>
+      <button
+        id="tab-previousclients"
+        onclick="showTab('previousclients')"
+        class="px-4 py-2 font-bold border-b-2 border-transparent"
+      >
+        Previous Clients
+      </button>
+      <button
+        id="tab-comparative"
+        onclick="showTab('comparative')"
+        class="px-4 py-2 font-bold border-b-2 border-transparent"
+      >
+        Comparative Analysis
+      </button>
+      <button
+        id="tab-blueprint"
+        onclick="showTab('blueprint')"
+        class="px-4 py-2 font-bold border-b-2 border-transparent"
+      >
+        Blueprint
+      </button>
+      <button
+        id="tab-visualanalysis"
+        onclick="showTab('visualanalysis')"
+        class="px-4 py-2 font-bold border-b-2 border-transparent"
+      >
+        Visual Analysis
+      </button>
+    </div>
+
+    <div id="panel-fingerprints">
+      <h2 class="text-2xl pt-5">Your fingerprints</h2>
+      <hr class="pb-5" />
 
     <div class="flex flex-wrap">
       <a
@@ -150,6 +2697,22 @@
         <p class="text-2xl break-all" id="peetprint-hash">Loading...</p>
         <p class="text-sm break-all" id="peetprint">Loading...</p>
       </a>
+    </div>
+
+    <div class="flex flex-wrap">
+      <div
+        class="bg-gray-100 dark:bg-gray-900 rounded-md shadow p-3 m-3 hover:bg-gray-50 dark:hover:bg-black min-w-fit max-w-full grow"
+      >
+        <h2 class="font-bold">JA4T (TCP client fingerprint)</h2>
+        <p class="text-2xl break-all font-mono" id="ja4t">Loading...</p>
+      </div>
+      <div
+        class="bg-gray-100 dark:bg-gray-900 rounded-md shadow p-3 m-3 hover:bg-gray-50 dark:hover:bg-black min-w-fit max-w-full grow"
+      >
+        <h2 class="font-bold">QOSF (QUIC OS fingerprint)</h2>
+        <p class="text-2xl break-all font-mono" id="qosf">Loading...</p>
+        <p class="text-xs text-gray-500 mt-1" id="qosf-note"></p>
+      </div>
     </div>
 
     <h2 class="text-2xl pt-5">Request details</h2>
@@ -327,81 +2890,920 @@
       </div>
     </div>
 
-    <h2 class="text-2xl pt-5">Donate</h2>
-    <hr class="pb-5" />
-    <p>
-      This API is free for you, but cost's me money and time to operate. If you
-      find it useful, please consider donating via crypto.
-    </p>
-    <div class="flex flex-wrap">
-      <div
-        class="bg-blue-100 dark:bg-yellow-900 dark:hover:bg-yellow-800 rounded-md shadow p-3 m-3 hover:bg-yellow-50 min-w-fit grow"
-      >
-        <h2 class="font-bold">Buy me a coffee</h2>
-        <p class="text-xl break-all" id="buymeacoffee">
-          <a href="https://www.buymeacoffee.com/peeet"> @peeet </a>
-        </p>
+    </div>
+    <!-- /panel-fingerprints -->
+
+    <div id="panel-sphbi" class="hidden">
+      <h2 class="text-2xl pt-5">Single Packet Header Binary Image (SPHBI)</h2>
+      <hr class="pb-5" />
+      <p class="mb-4 max-w-3xl" id="sphbi-intro">
+        Your live packet, encoded as a 144-bit <b>12×12 binary image</b>. Each
+        pixel is one bit (white = 1, black = 0). This is your real connection —
+        nothing here is synthetic.
+      </p>
+      <div class="flex flex-wrap items-start">
+        <div class="bg-gray-100 dark:bg-gray-900 rounded-md shadow p-4 m-3">
+          <h2 class="font-bold mb-2">
+            Binary image · <span id="sphbi-type">-</span>
+          </h2>
+          <canvas
+            id="sphbi-canvas"
+            width="12"
+            height="12"
+            class="border border-gray-400"
+            style="image-rendering: pixelated; width: 264px; height: 264px"
+          ></canvas>
+          <p class="text-xs mt-2 text-gray-500">
+            12×12 · white = 1 · black = 0
+          </p>
+        </div>
+        <div
+          class="bg-gray-100 dark:bg-gray-900 rounded-md shadow p-4 m-3 grow"
+        >
+          <h2 class="font-bold mb-2" id="sphbi-bytes-label">18 selected header bytes</h2>
+          <p class="text-sm break-all font-mono" id="sphbi-hex">-</p>
+          <table class="table-auto mt-3 text-sm" id="sphbi-fields">
+            <thead>
+              <tr>
+                <th class="text-left pr-4">Field</th>
+                <th class="text-left pr-4">Bytes</th>
+                <th class="text-left">Hex</th>
+              </tr>
+            </thead>
+          </table>
+        </div>
       </div>
-      <div
-        class="bg-blue-100 dark:bg-blue-900 dark:hover:bg-blue-800 rounded-md shadow p-3 m-3 hover:bg-blue-50 min-w-fit grow"
-      >
-        <h2 class="font-bold">Bitcoin (BTC)</h2>
-        <p class="text-xl break-all" id="btc">
-          bc1qc2av8uc7fdzr9696uqcqtdf2hl25rgmnvm9ys4
-        </p>
+      <div class="flex flex-wrap items-start">
+        <div class="bg-gray-100 dark:bg-gray-900 rounded-md shadow p-4 m-3 grow">
+          <h2 class="font-bold mb-1">JA4T · TCP client fingerprint</h2>
+          <p class="text-xs text-gray-500 mb-2 max-w-3xl">
+            FoxIO's TCP-layer fingerprint, computed from the <b>same SYN</b> as the
+            image above —
+            <span class="font-mono">window_options-order_MSS_wscale</span>. The image
+            encodes the 18 header bytes; JA4T encodes the TCP options.
+          </p>
+          <p class="text-2xl break-all font-mono" id="sphbi-ja4t">-</p>
+        </div>
       </div>
-      <div
-        class="bg-red-100 dark:bg-red-900 dark:hover:bg-red-800 rounded-md shadow p-3 m-3 hover:bg-red-50 min-w-fit grow"
-        data-clipboard-target="#sol"
-      >
-        <h2 class="font-bold">Solana (SOL)</h2>
-        <p class="text-xl break-all" id="sol">
-          DCCuNLirA9hXPHJGmCVhrkG6Kh4E2w8Bu6HHnXLbm78L
-        </p>
-      </div>
-      <div
-        class="bg-green-100 dark:bg-green-900 dark:hover:bg-green-800 rounded-md shadow p-3 m-3 hover:bg-green-50 min-w-fit grow"
-        data-clipboard-target="#eth"
-      >
-        <h2 class="font-bold">Ethereum (ETH)</h2>
-        <p class="text-xl break-all" id="eth">
-          0x3dEe894fd880816b1205dE915A00a42c85C44502
-        </p>
-      </div>
+      <p id="sphbi-missing" class="hidden text-yellow-600 m-3">
+        No SYN packet captured for this connection yet — reload the page (the
+        image is built from the SYN that opened your current connection).
+      </p>
+      <p class="text-xs text-gray-500 m-3 max-w-3xl">
+        Reference: El-Sherif, Khattab &amp; El-Soudani, "Intrusion detection
+        using TCP/IP single packet header binary image for IoT networks",
+        Cybersecurity (2025) 8:104.
+      </p>
+    </div>
+
+    <div id="panel-qosf" class="hidden">
+      <h2 class="text-2xl pt-5">QOSF · QUIC OS Fingerprint</h2>
+      <hr class="pb-5" />
+      <p class="mb-4 max-w-4xl text-sm">
+        QOSF is a readable, <b>QUIC-only</b> passive fingerprint, computed alongside your QUIC
+        JA4/SPHBI. Your QUIC <b>transport parameters</b> identify the QUIC <b>library</b> (segments
+        B/C/D); the <b>OS signal</b> is the kernel <b>TTL</b> on the UDP datagram (segment A), read by
+        the packet tap. Format
+        <span class="font-mono text-xs">q&lt;ttl&gt;&lt;ip&gt;&lt;ecn&gt;&lt;df&gt;&lt;flow&gt;_&lt;stack&gt;&lt;ver&gt;&lt;order&gt;&lt;grease&gt;&lt;scid&gt;_&lt;tp-set&gt;_&lt;tp-values&gt;</span>.
+      </p>
 
       <div
-        class="copy bg-violet-100 dark:bg-violet-900 dark:hover:bg-violet-800 rounded-md shadow p-3 m-3 hover:bg-violet-50 min-w-fit grow"
-        data-clipboard-target="#xmr"
+        id="qosf-empty"
+        class="hidden bg-yellow-50 dark:bg-yellow-900 rounded-md border border-yellow-400 p-4 m-3 max-w-3xl"
       >
-        <h2 class="font-bold">Monero (XMR)</h2>
-        <p class="text-xl break-all" id="xmr">
-          45jQVd3NnUxPVqDxqdYzA9hbfUDfygLhTiSY1c9mjiYEKL2YcLk4G9E48mRpA2Nd3m4hLxqwy8Y6TBJaAjAiyFazK5SpV1g
+        <p class="font-bold mb-1">No QOSF for this connection yet</p>
+        <p class="text-sm mb-3">
+          QOSF is <b>QUIC / HTTP-3 only</b>. Your current connection is
+          <span id="qosf-empty-proto" class="font-mono">…</span>. Modern browsers upgrade to HTTP/3
+          via <span class="font-mono">Alt-Svc</span> — recheck (or reload) and your QOSF appears.
+        </p>
+        <button
+          class="qosf-recheck-btn px-3 py-1.5 rounded bg-purple-600 text-white text-sm font-bold"
+          data-label="Recheck over HTTP/3"
+          onclick="qosfRefetch()"
+        >
+          Recheck over HTTP/3
+        </button>
+      </div>
+
+      <div id="qosf-view" class="hidden">
+        <div class="bg-gray-100 dark:bg-gray-900 rounded-md shadow p-4 m-3">
+          <div class="flex items-center gap-3 flex-wrap mb-2">
+            <span class="font-bold">Your QOSF</span>
+            <span id="qosf-source" class="text-xs font-bold px-2 py-0.5 rounded">…</span>
+            <button
+              class="qosf-recheck-btn text-xs px-2 py-0.5 rounded border border-purple-400 text-purple-600"
+              data-label="↻ recheck"
+              onclick="qosfRefetch()"
+            >
+              ↻ recheck
+            </button>
+          </div>
+          <p id="qosf-string" class="text-2xl break-all font-mono">…</p>
+        </div>
+
+        <div
+          id="qosf-os"
+          class="bg-gray-100 dark:bg-gray-900 rounded-md shadow p-4 m-3"
+          style="border-left: 5px solid #bf3a2b"
+        ></div>
+
+        <div
+          id="qosf-consistency"
+          class="bg-gray-100 dark:bg-gray-900 rounded-md shadow p-4 m-3"
+          style="border-left: 5px solid #6b7280"
+        ></div>
+
+        <div class="bg-gray-100 dark:bg-gray-900 rounded-md shadow p-4 m-3">
+          <h2 class="font-bold mb-1">Kernel space vs. user space</h2>
+          <p class="text-xs text-gray-500 mb-3 max-w-4xl">
+            QUIC runs in <b>user space</b>, so almost the whole fingerprint is written by the QUIC
+            <b>library</b> — only the IP/UDP header (segment A) is written by the OS <b>kernel</b>. That
+            is exactly why the OS signal has to come from the kernel TTL, not from anything QUIC sends.
+          </p>
+          <div id="qosf-spaces"></div>
+        </div>
+
+        <div
+          id="qosf-initial"
+          class="bg-gray-100 dark:bg-gray-900 rounded-md shadow p-4 m-3 hidden"
+          style="border-left: 5px solid #1f5fd0"
+        ></div>
+
+        <div class="bg-gray-100 dark:bg-gray-900 rounded-md shadow p-4 m-3">
+          <h2 class="font-bold mb-3">How your QOSF is built</h2>
+          <div id="qosf-flow"></div>
+        </div>
+
+        <h2 class="text-xl pt-3 pl-3 font-bold">Every field · observed vs derived vs absent</h2>
+        <div id="qosf-fields" class="flex flex-wrap"></div>
+
+        <p class="text-xs text-gray-500 m-3 max-w-4xl">
+          <b>Legend —</b>
+          <span style="color: #1f8a4c" class="font-bold">observed</span> = read directly from your
+          packets;
+          <span style="color: #d9741b" class="font-bold">derived</span> = inferred or classified
+          (initial TTL rounded up; an unverified stack → <span class="font-mono">xx</span>);
+          <span style="color: #9ca3af" class="font-bold">absent (—)</span> = the client did not send
+          it (never a fabricated RFC default). QOSF is valid only when this server is the
+          <b>first-hop QUIC terminator</b> (TrackMe is, via quic-go).
         </p>
       </div>
     </div>
 
-    <h2 class="text-2xl pt-5">Contact</h2>
-    <hr class="pb-5" />
-    <p>Please don't contact me for general programming help.</p>
-    <div class="flex flex-wrap">
-      <div
-        class="bg-blue-100 dark:bg-blue-900 dark:hover:bg-blue-800 rounded-md shadow p-3 m-3 hover:bg-blue-50 min-w-fit grow"
-      >
-        <h2 class="font-bold">Discord</h2>
-        <p class="text-xl break-all">@.peeet.</p>
+    <div id="panel-stackanalysis" class="hidden">
+      <h2 class="text-2xl pt-5">The contradiction stack</h2>
+      <hr class="pb-5" />
+      <p class="mb-4 max-w-4xl text-sm text-gray-500">
+        Defenders win through <b>cross-layer correlation</b>. Faking the top of the stack (the
+        User-Agent) is cheap — but every faked signal has to stay consistent with the harder-to-fake
+        signals beneath it. Below is <b>your live request</b>, testifying for or against itself: the
+        actual value we extracted at each layer, and a rule verdict on whether it agrees with the claim.
+      </p>
+      <div id="sa-verdict" class="m-3"></div>
+      <div id="sa-stack"></div>
+      <div class="m-3">
+        <button
+          onclick="renderStackAnalysis()"
+          class="text-xs px-3 py-1.5 rounded bg-red-600 text-white font-bold"
+        >
+          ↻ Re-run
+        </button>
       </div>
-      <div
-        class="bg-yellow-100 dark:bg-sky-900 dark:hover:bg-sky-800 rounded-md shadow p-3 m-3 hover:bg-yellow-50 min-w-fit grow"
-      >
-        <h2 class="font-bold">E-Mail</h2>
-        <p class="text-xl break-all">tls@peet.ws</p>
-      </div>
-      <div
-        class="bg-red-100 dark:bg-sky-900 dark:hover:bg-sky-800 rounded-md shadow p-3 m-3 hover:bg-yellow-50 min-w-fit grow"
-      >
-        <h2 class="font-bold">Portfolio</h2>
-        <a href="https://peet.ws" class="text-xl break-all">peet.ws</p>
+      <p class="text-xs text-gray-500 m-3 max-w-4xl">
+        A <span style="color: #f0533a" class="font-bold">contradiction</span> means a lower layer —
+        which is expensive or impossible to fake — disagrees with the User-Agent on top. These are
+        heuristics: a privacy tool, proxy, or VPN can also cause a mismatch, so treat a contradiction as
+        a strong signal, not proof.
+      </p>
+    </div>
+
+    <div id="panel-blueprint" class="hidden">
+      <p class="text-xs text-gray-500 m-3 max-w-3xl pt-3">
+        Isometric blueprint of your live TCP SYN (JA4T) and TLS ClientHello (JA4TLS),
+        every segment tokenized and colour-coded. Hover a callout to highlight its ribbon capsule.
+      </p>
+      <svg class="bp-svg" viewBox="0 0 1080 1080" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="bp-ttl bp-desc" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" style="width:100%;max-width:1080px;height:auto;display:block;margin:0 auto">
+        <title id="bp-ttl">Client fingerprint infographic — JA4T and JA4TLS</title>
+        <desc id="bp-desc">An isometric blueprint of your TCP SYN and TLS ClientHello, with every fingerprint segment tokenized, labelled and colour-coded.</desc>
+        <style>
+        .bp-svg{--bpink:#17130d;--bppaper:#fbfaf4;--bpfaint:#e0dbcb;--bpred:#bf3a2b;--bpblue:#1f5fd0;--bporange:#d9741b;--bpgreen:#1f8a4c;}
+        .bp-svg text{dominant-baseline:middle}
+        .bp-t{fill:var(--bpink)} .bp-muted{fill:#7c766a}
+        .bp-frame{fill:none;stroke:var(--bpink);stroke-width:2}
+        .bp-thin{fill:none;stroke:var(--bpink);stroke-width:1.1}
+        .bp-grid{fill:none;stroke:var(--bpfaint);stroke-width:.7}
+        .bp-leader{fill:none;stroke:var(--bpink);stroke-width:1.3;stroke-dasharray:760;stroke-dashoffset:760;animation:bpdraw 1.2s ease forwards}
+        .bp-node{fill:var(--bppaper);stroke:var(--bpink);stroke-width:1.4}
+        .bp-callout{cursor:default} .bp-callout .bp-box{stroke-width:1.4;fill:#fff} .bp-cap{cursor:default}
+        .bp-hl .bp-box,.bp-hl .bp-capbg{stroke-width:3}
+        .bp-hl .bp-pulse{animation:bppulse 1s ease-in-out infinite}
+        @keyframes bpdraw{to{stroke-dashoffset:0}}
+        @keyframes bppulse{0%,100%{opacity:1}50%{opacity:.45}}
+        @media (prefers-reduced-motion: reduce){.bp-leader{animation:none;stroke-dashoffset:0}.bp-hl .bp-pulse{animation:none}}
+        </style>
+        <defs>
+        <pattern id="bp-pat" width="36" height="36" patternUnits="userSpaceOnUse"><path d="M36 0H0V36" class="bp-grid"/></pattern>
+        <marker id="bp-ar" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L9 5L0 10z" fill="var(--bpink)"/></marker>
+        </defs>
+        <rect width="1080" height="1080" fill="var(--bppaper)"/>
+        <rect width="1080" height="1080" fill="url(#bp-pat)"/>
+        <rect x="14" y="14" width="1052" height="1052" class="bp-frame"/>
+        <path d="M14 54H54V14M1066 54H1026V14M14 1026H54V1066M1066 1026H1026V1066" class="bp-thin"/>
+        <path d="M44 44 L470 41 L472 150 L42 152 Z" class="bp-thin" fill="#fff"/>
+        <text x="62" y="78" class="bp-t" font-size="25" letter-spacing="1.5">CLIENT FINGERPRINT</text>
+        <text x="62" y="106" class="bp-t" font-size="17" letter-spacing="3">JA4T  /  JA4TLS</text>
+        <line x1="62" y1="120" x2="452" y2="120" class="bp-grid"/>
+        <text x="62" y="136" class="bp-muted" font-size="12">TS <tspan id="bp-ts" class="bp-t">—</tspan>   IP <tspan id="bp-ip" class="bp-t">—</tspan></text>
+        <g font-size="12.5">
+        <rect x="690" y="40" width="346" height="112" class="bp-thin" fill="#fff"/>
+        <text x="708" y="62" class="bp-muted" letter-spacing="2" font-size="11">COLOUR KEY</text>
+        <rect x="708" y="78" width="16" height="12" fill="var(--bpred)"/><text x="732" y="85" class="bp-t">TCP layer — window, options, scale</text>
+        <rect x="708" y="98" width="16" height="12" fill="var(--bpblue)"/><text x="732" y="105" class="bp-t">TLS metadata — version, SNI, ALPN</text>
+        <rect x="708" y="118" width="16" height="12" fill="var(--bporange)"/><text x="732" y="125" class="bp-t">Cipher suites — count + hash</text>
+        <rect x="708" y="136" width="16" height="12" fill="var(--bpgreen)"/><text x="732" y="143" class="bp-t">Extensions — count + hash</text>
+        </g>
+        <g opacity="0.96">
+        <path d="M480 360 L720 480 L480 600 L240 480 Z" fill="var(--bpred)" opacity="0.10"/>
+        <path d="M240 480 L480 600 L480 632 L240 512 Z" fill="var(--bpred)" opacity="0.22" stroke="var(--bpink)" stroke-width="1.2"/>
+        <path d="M480 600 L720 480 L720 512 L480 632 Z" fill="var(--bpred)" opacity="0.32" stroke="var(--bpink)" stroke-width="1.2"/>
+        <path d="M480 360 L720 480 L480 600 L240 480 Z" class="bp-thin"/>
+        <text x="480" y="582" text-anchor="middle" class="bp-t" font-size="12.5" letter-spacing="1">TCP SYN SEGMENT</text>
+        <path d="M600 150 L840 270 L600 390 L360 270 Z" fill="var(--bpblue)" opacity="0.09"/>
+        <path d="M360 270 L600 390 L600 420 L360 300 Z" fill="var(--bpblue)" opacity="0.20" stroke="var(--bpink)" stroke-width="1.2"/>
+        <path d="M600 390 L840 270 L840 300 L600 420 Z" fill="var(--bpblue)" opacity="0.30" stroke="var(--bpink)" stroke-width="1.2"/>
+        <path d="M600 150 L840 270 L600 390 L360 270 Z" class="bp-thin"/>
+        <text x="600" y="372" text-anchor="middle" class="bp-t" font-size="12.5" letter-spacing="1">TLS CLIENTHELLO</text>
+        <path d="M460 360 L560 300 M500 380 L600 320 M430 470 L580 392" stroke="var(--bpink)" stroke-width="1" stroke-dasharray="3 4" opacity=".55"/>
+        </g>
+        <g>
+        <circle cx="356" cy="436" r="4.5" class="bp-node"/><circle cx="404" cy="462" r="4.5" class="bp-node"/>
+        <circle cx="404" cy="500" r="4.5" class="bp-node"/><circle cx="452" cy="524" r="4.5" class="bp-node"/>
+        <circle cx="700" cy="246" r="4.5" class="bp-node"/><circle cx="726" cy="288" r="4.5" class="bp-node"/><circle cx="700" cy="322" r="4.5" class="bp-node"/>
+        </g>
+        <g>
+        <path class="bp-leader" d="M356 436 C300 420 250 392 226 372"/>
+        <path class="bp-leader" d="M404 462 C320 470 250 478 226 482"/>
+        <path class="bp-leader" d="M404 500 C320 540 250 580 226 592"/>
+        <path class="bp-leader" d="M452 524 C360 640 250 690 226 702"/>
+        <path class="bp-leader" d="M700 246 C780 250 830 256 854 262"/>
+        <path class="bp-leader" d="M726 288 C800 360 840 420 856 452"/>
+        <path class="bp-leader" d="M700 322 C780 520 840 600 856 642"/>
+        </g>
+        <g class="bp-callout" data-key="window">
+        <rect class="bp-box" x="40" y="338" width="186" height="68" stroke="var(--bpred)"/><rect x="40" y="338" width="6" height="68" fill="var(--bpred)"/>
+        <text x="58" y="360" class="bp-muted" font-size="11" letter-spacing="1">TCP WINDOW SIZE</text>
+        <text x="58" y="386" id="bp-v-window" class="bp-pulse" fill="var(--bpred)" font-size="22">—</text>
+        </g>
+        <g class="bp-callout" data-key="options">
+        <rect class="bp-box" x="40" y="448" width="186" height="86" stroke="var(--bpred)"/><rect x="40" y="448" width="6" height="86" fill="var(--bpred)"/>
+        <text x="58" y="468" class="bp-muted" font-size="11" letter-spacing="1">TCP OPTIONS ORDER</text>
+        <g id="bp-v-options" class="bp-pulse"></g>
+        </g>
+        <g class="bp-callout" data-key="mss">
+        <rect class="bp-box" x="40" y="558" width="186" height="68" stroke="var(--bpred)"/><rect x="40" y="558" width="6" height="68" fill="var(--bpred)"/>
+        <text x="58" y="580" class="bp-muted" font-size="11" letter-spacing="1">MSS VALUE</text>
+        <text x="58" y="606" id="bp-v-mss" class="bp-pulse" fill="var(--bpred)" font-size="22">—</text>
+        </g>
+        <g class="bp-callout" data-key="wscale">
+        <rect class="bp-box" x="40" y="668" width="186" height="68" stroke="var(--bpred)"/><rect x="40" y="668" width="6" height="68" fill="var(--bpred)"/>
+        <text x="58" y="690" class="bp-muted" font-size="11" letter-spacing="1">WINDOW SCALE</text>
+        <text x="58" y="716" id="bp-v-wscale" class="bp-pulse" fill="var(--bpred)" font-size="22">—</text>
+        </g>
+        <g class="bp-callout" data-key="header">
+        <rect class="bp-box" x="854" y="228" width="190" height="92" stroke="var(--bpblue)"/><rect x="1038" y="228" width="6" height="92" fill="var(--bpblue)"/>
+        <text x="872" y="248" class="bp-muted" font-size="11" letter-spacing="1">TLS HEADER BLOCK</text>
+        <g id="bp-v-header" font-size="12.5"></g>
+        </g>
+        <g class="bp-callout" data-key="cipher">
+        <rect class="bp-box" x="854" y="416" width="190" height="78" stroke="var(--bporange)"/><rect x="1038" y="416" width="6" height="78" fill="var(--bporange)"/>
+        <text x="872" y="436" class="bp-muted" font-size="11" letter-spacing="1">CIPHER SUITES</text>
+        <text x="872" y="458" class="bp-t" font-size="12"><tspan class="bp-muted">count</tspan> <tspan id="bp-v-ciphercount" fill="var(--bporange)" font-size="16">—</tspan></text>
+        <text x="872" y="480" id="bp-v-cipherhash" class="bp-pulse" fill="var(--bporange)" font-size="16">—</text>
+        </g>
+        <g class="bp-callout" data-key="ext">
+        <rect class="bp-box" x="854" y="608" width="190" height="78" stroke="var(--bpgreen)"/><rect x="1038" y="608" width="6" height="78" fill="var(--bpgreen)"/>
+        <text x="872" y="628" class="bp-muted" font-size="11" letter-spacing="1">EXTENSIONS + SIGALGS</text>
+        <text x="872" y="650" class="bp-t" font-size="12"><tspan class="bp-muted">count</tspan> <tspan id="bp-v-extcount" fill="var(--bpgreen)" font-size="16">—</tspan></text>
+        <text x="872" y="672" id="bp-v-exthash" class="bp-pulse" fill="var(--bpgreen)" font-size="16">—</text>
+        </g>
+        <g>
+        <rect x="40" y="772" width="470" height="150" class="bp-thin" fill="#fff"/>
+        <text x="58" y="794" class="bp-muted" font-size="11" letter-spacing="2">SCHEMATIC · TCP THREE-WAY HANDSHAKE</text>
+        <line x1="120" y1="812" x2="120" y2="908" class="bp-grid"/><line x1="430" y1="812" x2="430" y2="908" class="bp-grid"/>
+        <text x="120" y="824" text-anchor="middle" class="bp-t" font-size="11">client</text><text x="430" y="824" text-anchor="middle" class="bp-t" font-size="11">server</text>
+        <line x1="120" y1="846" x2="430" y2="846" class="bp-thin" marker-end="url(#bp-ar)"/><text x="275" y="838" text-anchor="middle" fill="var(--bpred)" font-size="11.5">SYN  ← JA4T captured here</text>
+        <line x1="430" y1="876" x2="120" y2="876" class="bp-thin" marker-end="url(#bp-ar)"/><text x="275" y="868" text-anchor="middle" class="bp-muted" font-size="11.5">SYN · ACK</text>
+        <line x1="120" y1="902" x2="430" y2="902" class="bp-thin" marker-end="url(#bp-ar)"/><text x="275" y="894" text-anchor="middle" class="bp-muted" font-size="11.5">ACK</text>
+        </g>
+        <g>
+        <rect x="570" y="772" width="470" height="150" class="bp-thin" fill="#fff"/>
+        <text x="588" y="794" class="bp-muted" font-size="11" letter-spacing="2">SCHEMATIC · TLS CLIENTHELLO FIELD MAP</text>
+        <g font-size="11.5">
+        <rect x="588" y="808" width="180" height="22" fill="var(--bpblue)" opacity=".14" stroke="var(--bpblue)" stroke-width="1"/><text x="598" y="819" fill="var(--bpblue)">version · record / supported</text>
+        <rect x="588" y="834" width="180" height="22" fill="var(--bpblue)" opacity=".14" stroke="var(--bpblue)" stroke-width="1"/><text x="598" y="845" fill="var(--bpblue)">SNI · server_name</text>
+        <rect x="778" y="808" width="252" height="22" fill="var(--bporange)" opacity=".16" stroke="var(--bporange)" stroke-width="1"/><text x="788" y="819" fill="var(--bporange)">cipher_suites[ ] → sorted → SHA-256</text>
+        <rect x="778" y="834" width="252" height="22" fill="var(--bpgreen)" opacity=".16" stroke="var(--bpgreen)" stroke-width="1"/><text x="788" y="845" fill="var(--bpgreen)">extensions[ ] + sig_algs → SHA-256</text>
+        <rect x="588" y="868" width="442" height="22" fill="var(--bpblue)" opacity=".14" stroke="var(--bpblue)" stroke-width="1"/><text x="598" y="879" fill="var(--bpblue)">ALPN · application_layer_protocol_negotiation → h2 / h3</text>
+        <text x="588" y="908" class="bp-muted">JA4_a header packs ver · SNI · counts · ALPN into 10 chars</text>
+        </g>
+        </g>
+        <text x="44" y="958" class="bp-muted" font-size="12" letter-spacing="3">JA4T  ·  TCP CLIENT FINGERPRINT</text>
+        <g id="bp-ribbon-ja4t" transform="translate(44 968)"></g>
+        <text x="44" y="1024" class="bp-muted" font-size="12" letter-spacing="3">JA4TLS  ·  TLS CLIENT FINGERPRINT</text>
+        <g id="bp-ribbon-ja4tls" transform="translate(44 1034)"></g>
+      </svg>
+
+      <!-- SPHBI image-matrix field maps (static reference, IPv4 + IPv6) -->
+      <div class="mx-3 mb-8 max-w-5xl">
+        <h2 class="text-lg font-bold mt-4 mb-1">SPHBI image matrix — field map</h2>
+        <p class="text-xs text-gray-500 mb-4 max-w-3xl">
+          How the 18 selected TCP/IP header bytes (144 bits) are arranged into the 12×12 SPHBI
+          binary image, and which header signal drives each pixel/region. The bits fill the grid
+          row-major (bit <em>i</em> → pixel x=<em>i</em>%12, y=<em>i</em>/12), each byte most-significant-bit
+          first. Cool colours = IP/IPv6 base header; warm colours = TCP header. Hover any cell for its
+          field, byte and bit range. Two layouts below — IPv4 and IPv6 (the IPv6 base header carries fewer
+          bytes, so the TCP MSS option backfills the image to 144 bits).
+        </p>
+        <h3 class="text-sm font-bold text-gray-700 dark:text-gray-200 mb-1">IPv4 SPHBI image</h3>
+        <div id="bp-sphbi-ipv4" class="mb-6 rounded border border-gray-200 dark:border-gray-700 bg-white p-2 overflow-x-auto"></div>
+        <h3 class="text-sm font-bold text-gray-700 dark:text-gray-200 mb-1">IPv6 SPHBI image</h3>
+        <div id="bp-sphbi-ipv6" class="rounded border border-gray-200 dark:border-gray-700 bg-white p-2 overflow-x-auto"></div>
+
+        <h2 class="text-lg font-bold mt-6 mb-1">QUIC transport-param image — by client stack</h2>
+        <p class="text-xs text-gray-500 mb-4 max-w-3xl">
+          QUIC/HTTP-3 has no TCP SYN, so the image encodes the client's <b>QUIC transport
+          parameters</b> instead (16 canonical slots × 9 bits = [present · value-fold], row-major;
+          JA4T is not applicable). Unlike the TCP SYN image — an <em>OS</em>-stack fingerprint — this
+          is an <em>implementation</em> fingerprint. Below are three real captures, all from the
+          <b>same macOS machine</b>, so every difference is purely the QUIC library.
+        </p>
+        <div id="bp-quic-stacks" class="rounded border border-gray-200 dark:border-gray-700 bg-white p-3 overflow-x-auto"></div>
       </div>
     </div>
+
+    <div id="panel-previousclients" class="hidden">
+      <div
+        class="mt-4 mb-4 px-4 py-3 rounded-md border-l-4 border-amber-500 bg-amber-100 dark:bg-amber-950/40 text-amber-800 dark:text-amber-200 text-sm"
+      >
+        ⚠ <strong>Historical records</strong> — these are fingerprints from
+        <em>previous visitors</em> to this server, not your own connection.
+      </div>
+      <div class="flex items-center justify-between mb-1">
+        <h2 class="text-2xl font-black">Previous Clients</h2>
+        <div class="flex items-center gap-2">
+          <button
+            id="pc-refresh"
+            onclick="pcRefresh()"
+            class="px-3 py-1 rounded bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-sm font-bold disabled:opacity-40"
+          >
+            ↻ Refresh
+          </button>
+          <button
+            onclick="pcBackfillASN()"
+            title="Warm the ASN cache for all stored client IPs (admin password)"
+            class="px-3 py-1 rounded bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-sm font-bold"
+          >
+            ⚲ Backfill ASN
+          </button>
+          <button
+            onclick="pcDeleteAll()"
+            title="Permanently delete all client history (password required)"
+            class="px-3 py-1 rounded bg-red-600 hover:bg-red-700 text-white text-sm font-bold"
+          >
+            🗑 Delete all
+          </button>
+        </div>
+      </div>
+      <hr class="mb-4 border-gray-300 dark:border-gray-700" />
+
+      <div id="pc-filterbar-home" class="hidden"></div>
+      <div id="pc-filterbar" class="flex flex-wrap items-end gap-3 mb-4">
+        <label class="flex flex-col text-xs text-gray-500"
+          >Kind
+          <select
+            id="pc-f-kind"
+            onchange="pcApplyFilters()"
+            class="mt-1 px-2 py-1 rounded border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 text-sm"
+          >
+            <option value="">All</option>
+            <option value="ipv4">IPv4</option>
+            <option value="ipv6">IPv6</option>
+            <option value="quic">QUIC</option>
+          </select>
+        </label>
+        <label class="flex flex-col text-xs text-gray-500"
+          >IP contains
+          <input
+            id="pc-f-ip"
+            oninput="pcApplyFilters()"
+            placeholder="e.g. 1.2.3"
+            class="mt-1 px-2 py-1 rounded border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 text-sm font-mono w-40"
+          />
+        </label>
+        <div class="flex flex-col text-xs text-gray-500 relative">
+          JA4 contains
+          <div class="mt-1 flex">
+            <input
+              id="pc-f-ja4"
+              oninput="pcApplyFilters()"
+              placeholder="e.g. t13d"
+              class="px-2 py-1 rounded-l border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 text-sm font-mono w-44"
+            />
+            <button
+              type="button"
+              id="pc-ja4-btn"
+              onclick="pcJa4Toggle(event)"
+              title="Pick from collected JA4 fingerprints"
+              class="px-2 py-1 rounded-r border border-l-0 border-gray-300 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-500 text-sm"
+            >
+              ▾
+            </button>
+          </div>
+          <div
+            id="pc-ja4-panel"
+            class="hidden absolute top-full left-0 z-30 mt-1 w-80 max-h-72 overflow-auto rounded border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 shadow-lg p-2"
+          >
+            <input
+              id="pc-ja4-search"
+              oninput="pcJa4Render()"
+              placeholder="search fingerprints…"
+              class="w-full mb-1 px-2 py-1 text-xs font-normal rounded border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900"
+            />
+            <div class="flex justify-between items-center mb-1">
+              <span id="pc-ja4-count" class="text-[10px] text-gray-400 font-normal"></span>
+              <button type="button" onclick="pcJa4ClearInput(event)" class="text-xs font-normal text-gray-500 hover:text-blue-600 underline decoration-dotted">clear</button>
+            </div>
+            <div id="pc-ja4-options" class="space-y-0.5"></div>
+          </div>
+        </div>
+        <div class="flex flex-col text-xs text-gray-500 relative">
+          ASN contains
+          <div class="mt-1 flex">
+            <input
+              id="pc-f-asn"
+              oninput="pcApplyFilters()"
+              placeholder="e.g. AS7018 or AT&amp;T"
+              class="px-2 py-1 rounded-l border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 text-sm font-mono w-44"
+            />
+            <button
+              type="button"
+              id="pc-asn-btn"
+              onclick="pcAsnToggle(event)"
+              title="Pick from ASNs seen"
+              class="px-2 py-1 rounded-r border border-l-0 border-gray-300 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-500 text-sm"
+            >
+              ▾
+            </button>
+          </div>
+          <div
+            id="pc-asn-panel"
+            class="hidden absolute top-full left-0 z-30 mt-1 w-80 max-h-72 overflow-auto rounded border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 shadow-lg p-2"
+          >
+            <input
+              id="pc-asn-search"
+              oninput="pcAsnRender()"
+              placeholder="search ASNs / operators…"
+              class="w-full mb-1 px-2 py-1 text-xs font-normal rounded border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900"
+            />
+            <div class="flex justify-between items-center mb-1">
+              <span id="pc-asn-count" class="text-[10px] text-gray-400 font-normal"></span>
+              <button type="button" onclick="pcAsnClearInput(event)" class="text-xs font-normal text-gray-500 hover:text-blue-600 underline decoration-dotted">clear</button>
+            </div>
+            <div id="pc-asn-options" class="space-y-0.5"></div>
+          </div>
+        </div>
+        <label class="flex flex-col text-xs text-gray-500"
+          >User-Agent contains
+          <input
+            id="pc-f-ua"
+            oninput="pcApplyFilters()"
+            placeholder="e.g. Chrome, iPhone"
+            class="mt-1 px-2 py-1 rounded border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 text-sm w-56"
+          />
+        </label>
+        <label class="flex flex-col text-xs text-blue-700 dark:text-blue-300 font-bold"
+          >Query param
+          <input
+            id="pc-f-qparam"
+            oninput="pcApplyFilters()"
+            placeholder="e.g. dee"
+            class="mt-1 px-2 py-1 rounded border border-blue-300 dark:border-blue-700 bg-white dark:bg-gray-900 text-sm font-mono w-32"
+          />
+        </label>
+        <label class="flex flex-col text-xs text-blue-700 dark:text-blue-300 font-bold"
+          >Query value
+          <input
+            id="pc-f-qvalue"
+            oninput="pcApplyFilters()"
+            placeholder="e.g. money"
+            class="mt-1 px-2 py-1 rounded border border-blue-300 dark:border-blue-700 bg-white dark:bg-gray-900 text-sm font-mono w-32"
+          />
+        </label>
+        <div class="flex flex-col text-xs text-blue-700 dark:text-blue-300 font-bold relative">
+          scraping-header
+          <button
+            type="button"
+            id="pc-sh-btn"
+            onclick="pcShToggle(event)"
+            class="mt-1 px-2 py-1 rounded border border-blue-300 dark:border-blue-700 bg-white dark:bg-gray-900 text-sm font-normal text-gray-700 dark:text-gray-200 text-left w-44 flex items-center justify-between"
+          >
+            <span id="pc-sh-label">Any</span><span class="text-gray-400">▾</span>
+          </button>
+          <div
+            id="pc-sh-panel"
+            class="hidden absolute top-full left-0 z-30 mt-1 w-56 max-h-72 overflow-auto rounded border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 shadow-lg p-2"
+          >
+            <input
+              id="pc-sh-search"
+              oninput="pcShRender()"
+              placeholder="search values…"
+              class="w-full mb-1 px-2 py-1 text-xs font-normal rounded border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900"
+            />
+            <div class="flex justify-end mb-1">
+              <button type="button" onclick="pcShClear(event)" class="text-xs font-normal text-gray-500 hover:text-blue-600 underline decoration-dotted">clear</button>
+            </div>
+            <div id="pc-sh-options" class="space-y-0.5"></div>
+          </div>
+        </div>
+        <label class="flex items-center gap-1.5 self-center mt-3 text-xs font-bold text-amber-700 dark:text-amber-300 cursor-pointer">
+          <input
+            type="checkbox"
+            id="pc-f-collected"
+            onchange="pcApplyFilters()"
+            class="accent-amber-500 w-4 h-4"
+          />
+          Only with captured requests
+        </label>
+        <button
+          onclick="pcClearFilters()"
+          class="px-3 py-1 rounded bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-sm font-bold"
+        >
+          Clear
+        </button>
+      </div>
+
+      <div class="flex flex-col lg:flex-row gap-4">
+        <!-- master table -->
+        <div class="lg:w-[520px] lg:flex-shrink-0">
+          <div class="overflow-auto max-h-[70vh]">
+            <table class="w-full text-sm">
+              <thead>
+                <tr class="text-left text-gray-500 border-b border-gray-300 dark:border-gray-700">
+                  <th class="py-2 pr-2">Img</th>
+                  <th class="py-2 pr-2">Client</th>
+                  <th class="py-2 pr-2 cursor-pointer select-none" onclick="pcSetSort('kind')">Kind<span data-sort="kind"></span></th>
+                  <th class="py-2 pr-2 cursor-pointer select-none" onclick="pcSetSort('last_seen')">Last seen<span data-sort="last_seen"></span></th>
+                  <th class="py-2 pr-2 text-right cursor-pointer select-none" onclick="pcSetSort('visits')">Visits<span data-sort="visits"></span></th>
+                  <th class="py-2 pr-2 text-right cursor-pointer select-none" onclick="pcSetSort('ips')">IPs<span data-sort="ips"></span></th>
+                  <th class="py-2 pr-2">IP</th>
+                  <th class="py-2 pr-2 cursor-pointer select-none" onclick="pcSetSort('ja4')">JA4<span data-sort="ja4"></span></th>
+                  <th class="py-2 cursor-pointer select-none" onclick="pcSetSort('ua')">User agent<span data-sort="ua"></span></th>
+                  <th class="py-2"></th>
+                </tr>
+              </thead>
+              <tbody id="pc-tbody">
+                <tr>
+                  <td colspan="10" class="py-4 text-gray-500">Loading…</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div
+            class="flex items-center justify-between mt-3 pt-3 border-t border-gray-300 dark:border-gray-700 text-sm text-gray-500"
+          >
+            <span id="pc-page-info">—</span>
+            <div class="flex gap-2">
+              <button
+                id="pc-prev"
+                onclick="pcChangePage(-1)"
+                class="px-3 py-1 rounded bg-gray-200 dark:bg-gray-700 disabled:opacity-40 font-bold"
+                disabled
+              >
+                ← Prev
+              </button>
+              <button
+                id="pc-next"
+                onclick="pcChangePage(1)"
+                class="px-3 py-1 rounded bg-gray-200 dark:bg-gray-700 disabled:opacity-40 font-bold"
+                disabled
+              >
+                Next →
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- detail pane -->
+        <div
+          id="pc-detail"
+          class="grow lg:pl-5 lg:border-l lg:border-gray-300 dark:lg:border-gray-700"
+        >
+          <p id="pc-detail-empty" class="text-gray-500 py-10 text-center">
+            ← Select a previous client to view its SPHBI image next to its
+            identifying information.
+          </p>
+          <div id="pc-detail-content" class="hidden"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="panel-comparative" class="hidden">
+      <div
+        class="mt-4 mb-4 px-4 py-3 rounded-md border-l-4 border-teal-500 bg-teal-50 dark:bg-teal-950/40 text-teal-800 dark:text-teal-200 text-sm"
+      >
+        🔬 <strong>Comparative Analysis</strong> — pick SPHBI images from the filtered pool to compare them
+        side by side. The filters below are shared live with the Previous Clients tab.
+      </div>
+      <div id="ca-filterbar-slot" class="mb-2"></div>
+      <hr class="mb-4 border-gray-300 dark:border-gray-700" />
+      <div class="flex flex-col lg:flex-row gap-5">
+        <!-- pool of selectable images -->
+        <div class="lg:w-1/2 lg:flex-shrink-0">
+          <div class="flex items-center justify-between mb-2">
+            <h3 class="font-bold">Image pool</h3>
+            <span id="ca-pool-info" class="text-xs text-gray-500"></span>
+          </div>
+          <label
+            class="flex items-center gap-1.5 mb-2 text-xs text-gray-600 dark:text-gray-300 cursor-pointer select-none"
+            title="Group the pool by scraping-header value and keep only one client per distinct SPHBI image within each group. Groups come from the selected scraping-header filter values, or all known values when none are selected."
+          >
+            <input type="checkbox" id="ca-unique-sh" class="rounded" onchange="caFetchPool()" />
+            Unique images per scraping-header group
+          </label>
+          <div
+            id="ca-pool"
+            class="grid gap-2 overflow-auto max-h-[72vh] pr-1"
+            style="grid-template-columns: repeat(auto-fill, minmax(66px, 1fr))"
+          ></div>
+        </div>
+        <!-- side-by-side comparison tray -->
+        <div class="lg:w-1/2 lg:border-l border-gray-300 dark:border-gray-700 lg:pl-5">
+          <div class="flex items-center justify-between mb-2">
+            <h3 class="font-bold">Comparison <span id="ca-count" class="text-xs text-gray-500 font-normal"></span></h3>
+            <button onclick="caClear()" class="text-xs text-gray-500 hover:text-red-600 underline decoration-dotted">
+              clear all
+            </button>
+          </div>
+          <div id="ca-tray"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="panel-visualanalysis" class="hidden">
+      <div
+        class="mt-4 mb-4 px-4 py-3 rounded-md border-l-4 border-indigo-500 bg-indigo-50 dark:bg-indigo-950/40 text-indigo-800 dark:text-indigo-200 text-sm"
+      >
+        🕸 <strong>Visual Analysis</strong> — pick a JA4 fingerprint to see every distinct SPHBI image linked to it.
+        <span class="font-semibold">Scrapers</span> sit on the left, the <span class="font-semibold">JA4</span> in the
+        middle, and <span class="font-semibold">BrowserStack devices</span> on the right — the same TLS fingerprint can
+        front many different TCP/IP packet images. Drag to pan, scroll to zoom.
+      </div>
+      <div class="flex flex-wrap items-center gap-3 mb-3">
+        <label class="text-sm font-bold" for="va-ja4-select">JA4 fingerprint:</label>
+        <select
+          id="va-ja4-select"
+          class="font-mono text-sm border rounded px-2 py-1 bg-white dark:bg-gray-900 dark:border-gray-700"
+          style="min-width: 22rem; max-width: 100%"
+        >
+          <option value="">Loading…</option>
+        </select>
+        <span id="va-info" class="text-xs text-gray-500"></span>
+      </div>
+      <div
+        id="va-flow"
+        class="w-full rounded-md border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-950"
+        style="height: 72vh"
+      ></div>
+    </div>
+
+    <!--
+      Visual Analysis owns its React Flow graph. React + @xyflow/react are loaded
+      LAZILY (dynamic import on first tab open), mirroring the on-demand Leaflet
+      injection — no build step, no cost until the tab is used. esm.sh serves a single
+      pinned React 18.3.1 to React Flow (deps=) so there is exactly one React instance.
+    -->
+    <script type="module">
+      (() => {
+        const ESM = "https://esm.sh/";
+        const REACT = "react@18.3.1";
+        const RF = "@xyflow/react@12.11.0";
+        const DEPS = "deps=react@18.3.1,react-dom@18.3.1";
+
+        let libs = null; // cached imported modules
+        let comp = null; // cached React components (stable nodeTypes)
+        let root = null; // current React root
+        let mounted = false;
+
+        // Same algorithm as pcDrawCanvas: 12x12, white=1/black=0, MSB-first row-major.
+        const drawSphbi = (canvas, bits, size) => {
+          const n = size || 12;
+          canvas.width = n;
+          canvas.height = n;
+          const ctx = canvas.getContext("2d");
+          const img = ctx.createImageData(n, n);
+          bits = bits || "";
+          for (let i = 0; i < n * n && i < bits.length; i++) {
+            const on = bits[i] === "1" ? 255 : 0;
+            img.data[i * 4] = on;
+            img.data[i * 4 + 1] = on;
+            img.data[i * 4 + 2] = on;
+            img.data[i * 4 + 3] = 255;
+          }
+          ctx.putImageData(img, 0, 0);
+        };
+
+        async function ensureLibs() {
+          if (libs) return libs;
+          if (!document.getElementById("va-rf-css")) {
+            const l = document.createElement("link");
+            l.id = "va-rf-css";
+            l.rel = "stylesheet";
+            l.href = ESM + RF + "/dist/style.css";
+            document.head.appendChild(l);
+          }
+          const ReactNS = await import(ESM + REACT);
+          const React = ReactNS.default || ReactNS; // canonical React object (hooks + createElement)
+          const ReactDOMClient = await import(ESM + "react-dom@18.3.1/client");
+          const htmMod = await import(ESM + "htm@3.1.1");
+          const xy = await import(ESM + RF + "?" + DEPS);
+          const h = htmMod.default.bind(React.createElement);
+          libs = { React, h, xy, createRoot: ReactDOMClient.createRoot };
+          return libs;
+        }
+
+        const lastSeg = (s) => (s.indexOf(".") >= 0 ? s.split(".").pop() : s);
+        const shortLabel = (d) => {
+          const ls = d.labels || [];
+          const pretty = (s) => (d.side === "left" ? lastSeg(s) : s);
+          if (ls.length === 0) return d.device || d.bits.slice(0, 6);
+          if (ls.length === 1) return pretty(ls[0]);
+          return pretty(ls[0]) + " +" + (ls.length - 1);
+        };
+
+        function buildComponents(mods) {
+          if (comp) return comp;
+          const { React, h, xy } = mods;
+          const { Handle, Position, ReactFlow, Background, Controls } = xy;
+
+          function SphbiNode(props) {
+            const d = props.data;
+            const ref = React.useRef(null);
+            React.useEffect(() => {
+              if (ref.current) drawSphbi(ref.current, d.bits, d.size || 12);
+            }, [d.bits]);
+            const accent = d.side === "left" ? "#6366f1" : "#14b8a6";
+            const card = {
+              display: "flex", flexDirection: "column", alignItems: "center", gap: "2px",
+              padding: "4px", border: "1px solid " + accent, borderRadius: "6px",
+              background: "rgba(127,127,127,0.10)", width: "120px",
+            };
+            return h`<div style=${card} title=${(d.labels || []).join(", ")}>
+              ${d.side === "left"
+                ? h`<${Handle} type="source" position=${Position.Right} id="out" />`
+                : h`<${Handle} type="target" position=${Position.Left} id="in" />`}
+              <canvas ref=${ref} width="12" height="12"
+                style=${{ width: "44px", height: "44px", imageRendering: "pixelated", border: "1px solid rgba(0,0,0,0.25)" }}></canvas>
+              <div style=${{ fontSize: "9px", lineHeight: "1.15", textAlign: "center", wordBreak: "break-word", maxWidth: "112px" }}>
+                ${shortLabel(d)}
+              </div>
+              ${d.count > 1 ? h`<div style=${{ fontSize: "9px", fontWeight: "bold", color: accent }}>×${d.count}</div>` : null}
+            </div>`;
+          }
+
+          function Ja4Node(props) {
+            const d = props.data;
+            const box = {
+              display: "flex", flexDirection: "column", alignItems: "center", gap: "3px",
+              padding: "8px 10px", border: "2px solid #4f46e5", borderRadius: "8px",
+              background: "rgba(99,102,241,0.15)", width: "210px",
+            };
+            return h`<div style=${box}>
+              <${Handle} type="target" position=${Position.Left} id="in" />
+              <div style=${{ fontWeight: "bold", fontSize: "11px", letterSpacing: "0.05em" }}>JA4</div>
+              <div style=${{ fontFamily: "monospace", fontSize: "10px", wordBreak: "break-all", textAlign: "center" }}>${d.ja4}</div>
+              <div style=${{ fontSize: "9px", opacity: 0.8 }}>${d.left} scraper · ${d.right} device images</div>
+              <${Handle} type="source" position=${Position.Right} id="out" />
+            </div>`;
+          }
+
+          const nodeTypes = { sphbi: SphbiNode, ja4: Ja4Node };
+
+          // Manual two-column layout; each side wraps into sub-columns past PER_COL so a
+          // large right side (hundreds of device images) stays navigable via pan/zoom.
+          const PER_COL = 16, V_GAP = 84, H_GAP = 210;
+          function layout(data) {
+            const left = data.left || [], right = data.right || [];
+            const nodes = [], edges = [];
+            const rows = Math.max(Math.min(left.length, PER_COL), Math.min(right.length, PER_COL), 1);
+            const centerY = ((rows - 1) * V_GAP) / 2;
+            nodes.push({
+              id: "ja4", type: "ja4", position: { x: 0, y: centerY }, draggable: false,
+              data: { ja4: data.ja4, left: data.left_total, right: data.right_total },
+            });
+            left.forEach((n, i) => {
+              const col = Math.floor(i / PER_COL), rowN = i % PER_COL, id = "L" + i;
+              nodes.push({ id, type: "sphbi", position: { x: -(H_GAP * (col + 1)) - 170, y: rowN * V_GAP }, data: { ...n, side: "left" } });
+              edges.push({ id: "e" + id, source: id, sourceHandle: "out", target: "ja4", targetHandle: "in", style: { stroke: "#6366f1" } });
+            });
+            right.forEach((n, i) => {
+              const col = Math.floor(i / PER_COL), rowN = i % PER_COL, id = "R" + i;
+              nodes.push({ id, type: "sphbi", position: { x: H_GAP * (col + 1) + 170, y: rowN * V_GAP }, data: { ...n, side: "right" } });
+              edges.push({ id: "e" + id, source: "ja4", sourceHandle: "out", target: id, targetHandle: "in", style: { stroke: "#14b8a6" } });
+            });
+            return { nodes, edges };
+          }
+
+          function App(props) {
+            const data = props.data;
+            const { nodes, edges } = React.useMemo(() => layout(data), [data]);
+            const rf = React.useRef(null);
+            const fit = () => rf.current && requestAnimationFrame(() => rf.current.fitView({ padding: 0.2 }));
+            const onInit = React.useCallback((inst) => { rf.current = inst; fit(); }, []);
+            React.useEffect(() => { fit(); }, [data]);
+            React.useEffect(() => {
+              const onShown = () => setTimeout(fit, 60);
+              window.addEventListener("va:shown", onShown);
+              return () => window.removeEventListener("va:shown", onShown);
+            }, []);
+            return h`<${ReactFlow} nodes=${nodes} edges=${edges} nodeTypes=${nodeTypes}
+              onInit=${onInit} minZoom=${0.05} fitView>
+              <${Background} /><${Controls} /><//>`;
+          }
+
+          comp = { App };
+          return comp;
+        }
+
+        function teardown() {
+          if (root) { root.unmount(); root = null; }
+          const host = document.getElementById("va-flow");
+          if (host) host.innerHTML = "";
+        }
+
+        async function render(ja4) {
+          const info = document.getElementById("va-info");
+          const host = document.getElementById("va-flow");
+          if (!ja4) { teardown(); if (info) info.textContent = ""; return; }
+          info.textContent = "loading…";
+          let mods;
+          try { mods = await ensureLibs(); }
+          catch (e) { info.textContent = "failed to load React Flow: " + e.message; return; }
+          let data;
+          try { data = await fetch("/api/sphbi/by-ja4?ja4=" + encodeURIComponent(ja4)).then((r) => r.json()); }
+          catch (e) { info.textContent = "fetch failed: " + e.message; return; }
+          if (data.error) { info.textContent = "error: " + data.error; return; }
+          const lt = data.left_total || 0, rt = data.right_total || 0;
+          if (lt === 0 && rt === 0) {
+            teardown();
+            host.innerHTML = '<div style="padding:1rem;color:#888;font-size:0.9rem">No SPHBI images are linked to this JA4 yet.</div>';
+            info.textContent = "";
+            return;
+          }
+          info.textContent =
+            lt + " scraper image" + (lt === 1 ? "" : "s") + " · " +
+            rt + " device image" + (rt === 1 ? "" : "s") +
+            (data.left_truncated || data.right_truncated ? " (capped at 400/side)" : "");
+          const { h, createRoot } = mods;
+          const { App } = buildComponents(mods);
+          if (!root) { host.innerHTML = ""; root = createRoot(host); }
+          root.render(h`<${App} data=${data} />`);
+        }
+
+        async function mount() {
+          const sel = document.getElementById("va-ja4-select");
+          if (!sel) return;
+          if (!mounted) {
+            mounted = true;
+            try {
+              // Only JA4s that actually have labeled SPHBI images (so a pick can't
+              // render an empty graph); each carries per-side image counts.
+              const vals = await fetch("/api/sphbi/ja4values").then((r) => r.json());
+              const list = Array.isArray(vals) ? vals : [];
+              sel.innerHTML = "";
+              const ph = document.createElement("option");
+              ph.value = "";
+              ph.textContent = list.length
+                ? "— select one of " + list.length + " JA4s with images —"
+                : "— no JA4s have SPHBI images yet —";
+              sel.appendChild(ph);
+              list.forEach((e) => {
+                const o = document.createElement("option");
+                o.value = e.ja4;
+                o.textContent = e.ja4 + "  ·  " + (e.left || 0) + " scraper / " + (e.right || 0) + " device";
+                sel.appendChild(o);
+              });
+            } catch (e) {
+              sel.innerHTML = '<option value="">failed to load JA4 list</option>';
+            }
+            sel.addEventListener("change", () => render(sel.value));
+          }
+          // Re-fit when returning to the tab (container had no size while hidden).
+          window.dispatchEvent(new CustomEvent("va:shown"));
+        }
+
+        window.VA = { mount, render };
+      })();
+    </script>
   </body>
 </html>
